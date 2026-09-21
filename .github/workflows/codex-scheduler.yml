@@ -95,7 +95,6 @@ jobs:
 
             comments="$(gh issue view "$issue_number" \
               --repo "$REPO" \
-              --comments \
               --json comments \
               --jq '[.comments[].body]')"
 

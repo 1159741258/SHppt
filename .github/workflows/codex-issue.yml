@@ -49,7 +49,7 @@ jobs:
             | jq '{number,title,body,state,url,labels:[.labels[].name],assignees:[.assignees[].login],issue_dependencies_summary}' \
             > .github/codex/runtime/issue.json
 
-          comments="$(gh issue view "$ISSUE_NUMBER" --comments --json comments --jq '[.comments[].body]')"
+          comments="$(gh issue view "$ISSUE_NUMBER" --json comments --jq '[.comments[].body]')"
           jq --argjson comments "$comments" '. + {comments:$comments}' \
             .github/codex/runtime/issue.json \
             > .github/codex/runtime/issue.with-comments.json
