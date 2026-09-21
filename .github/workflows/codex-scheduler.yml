@@ -93,15 +93,6 @@ jobs:
               continue
             fi
 
-            comments="$(gh issue view "$issue_number" \
-              --repo "$REPO" \
-              --json comments \
-              --jq '[.comments[].body]')"
-
-            if ! jq -e 'any(.[]; contains("## Agent Brief") and contains("**Acceptance criteria:**") and contains("**Out of scope:**"))' <<< "$comments" > /dev/null; then
-              continue
-            fi
-
             dependency_count="$(gh api "repos/$REPO/issues/$issue_number" \
               --jq '.issue_dependencies_summary.blocked_by // 0')"
             if [[ "$dependency_count" != "0" ]]; then
