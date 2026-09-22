@@ -1,0 +1,15 @@
+{
+  "name": "shppt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal Windows HTML-first preview runtime for SHppt",
+  "scripts": {
+    "start": "node src/daemon.mjs",
+    "probe": "node tools/preview-probe.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
