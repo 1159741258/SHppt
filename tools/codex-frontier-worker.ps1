@@ -10,24 +10,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Invoke-ExternalText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
-        [Parameter(Mandatory = $true)]
-        [string[]]$Arguments
-    )
-
-    $output = & $FilePath @Arguments 2>&1
-
-    if ($LASTEXITCODE -ne 0) {
-        $details = ($output | Out-String).Trim()
-        throw "$FilePath failed with exit code $LASTEXITCODE. $details"
-    }
-
-    return ($output -join "`n").Trim()
-}
-
 function Invoke-RepoCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -53,7 +35,21 @@ function Invoke-GhText {
         [string[]]$Arguments
     )
 
-    return Invoke-ExternalText -FilePath "gh" -Arguments $Arguments
+    $stderrPath = Join-Path $env:TEMP "codex-frontier-gh-$([guid]::NewGuid().ToString('N')).log"
+    try {
+        $output = & gh @Arguments 2> $stderrPath
+        if ($LASTEXITCODE -ne 0) {
+            $details = (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
+            if ([string]::IsNullOrWhiteSpace($details)) {
+                $details = ($output | Out-String).Trim()
+            }
+            throw "gh failed with exit code $LASTEXITCODE. $details"
+        }
+
+        return ($output -join "`n").Trim()
+    } finally {
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-GhJson {
@@ -67,7 +63,11 @@ function Invoke-GhJson {
         return $null
     }
 
-    return $text | ConvertFrom-Json
+    try {
+        return ConvertFrom-Json -InputObject $text -Depth 100
+    } catch {
+        throw "gh returned invalid JSON: $($_.Exception.Message)"
+    }
 }
 
 function Write-JsonFile {
