@@ -55,19 +55,28 @@ function Invoke-GhText {
 function Invoke-GhJson {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [string]$Name = "gh command"
     )
 
-    $text = Invoke-GhText -Arguments $Arguments
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        return $null
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $text = Invoke-GhText -Arguments $Arguments
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return $null
+        }
+
+        try {
+            return ConvertFrom-Json -InputObject $text -Depth 100
+        } catch {
+            $lastError = $_.Exception.Message
+            if ($attempt -lt 2) {
+                Start-Sleep -Milliseconds 300
+            }
+        }
     }
 
-    try {
-        return ConvertFrom-Json -InputObject $text -Depth 100
-    } catch {
-        throw "gh returned invalid JSON: $($_.Exception.Message)"
-    }
+    throw "gh returned invalid JSON for ${Name}: $lastError"
 }
 
 function Write-JsonFile {
@@ -119,8 +128,8 @@ function Get-IssueCandidates {
             Invoke-GhJson -Arguments @(
                 "issue", "view", "$script:RequestedIssueNumber",
                 "--repo", $script:Repo,
-                "--json", "number,title,body,state,labels,assignees,createdAt,url"
-            )
+                "--json", "number,title,state,labels,assignees,createdAt,url"
+            ) -Name "issue #$script:RequestedIssueNumber"
         )
     }
 
@@ -131,8 +140,8 @@ function Get-IssueCandidates {
             "--state", "open",
             "--label", "ready-for-agent",
             "--limit", "1000",
-            "--json", "number,title,body,state,labels,assignees,createdAt,url"
-        ) | Sort-Object -Property number
+            "--json", "number,title,state,labels,assignees,createdAt,url"
+        ) -Name "ready-for-agent issue list" | Sort-Object -Property number
     )
 }
 
@@ -143,10 +152,10 @@ function Get-IssueDetails {
         "issue", "view", "$Number",
         "--repo", $script:Repo,
         "--json", "number,title,body,state,labels,assignees,comments,url"
-    )
+    ) -Name "issue #$Number"
     $apiIssue = Invoke-GhJson -Arguments @(
         "api", "repos/$($script:Repo)/issues/$Number"
-    )
+    ) -Name "issue API #$Number"
 
     $dependencySummary = $apiIssue.issue_dependencies_summary
     $comments = @($issue.comments | ForEach-Object { $_.body })
@@ -171,8 +180,8 @@ function Get-OpenCodexPullRequests {
             "--repo", $script:Repo,
             "--state", "open",
             "--limit", "1000",
-            "--json", "headRefName,body,number,url"
-        )
+            "--json", "headRefName,number,url"
+        ) -Name "open pull request list"
     )
 }
 
@@ -184,11 +193,6 @@ function Test-OpenCodexPullRequest {
 
     $branchPrefix = "codex/issue-$Number-"
     if ($PullRequest.headRefName -and $PullRequest.headRefName.StartsWith($branchPrefix)) {
-        return $true
-    }
-
-    $body = [string]$PullRequest.body
-    if ($body -and $body -match "(?i)(fixes|closes|resolves)\s+#$Number(?:\D|$)") {
         return $true
     }
 
@@ -308,17 +312,13 @@ Reason: $Reason
 }
 
 function Get-IssueNumbersFromPullRequest {
-    param([string]$Body)
+    param([object]$PullRequest)
 
-    if ([string]::IsNullOrWhiteSpace($Body)) {
-        return @()
+    if ($PullRequest.headRefName -match '^codex/issue-(\d+)-') {
+        return @([int]$Matches[1])
     }
 
-    return @(
-        [regex]::Matches($Body, "(?i)(fixes|closes|resolves)\s+#(\d+)") |
-            ForEach-Object { [int]$_.Groups[2].Value } |
-            Sort-Object -Unique
-    )
+    return @()
 }
 
 function Cleanup-ClosedCodexPullRequests {
@@ -328,8 +328,8 @@ function Cleanup-ClosedCodexPullRequests {
             "--repo", $script:Repo,
             "--state", "closed",
             "--limit", "1000",
-            "--json", "body,headRefName,mergedAt,number,url"
-        )
+            "--json", "headRefName,mergedAt,number,url"
+        ) -Name "closed pull request list"
     )
 
     foreach ($pullRequest in $closedPullRequests) {
@@ -337,12 +337,12 @@ function Cleanup-ClosedCodexPullRequests {
             continue
         }
 
-        foreach ($number in @(Get-IssueNumbersFromPullRequest -Body ([string]$pullRequest.body))) {
+        foreach ($number in @(Get-IssueNumbersFromPullRequest -PullRequest $pullRequest)) {
             $issue = Invoke-GhJson -Arguments @(
                 "issue", "view", "$number",
                 "--repo", $script:Repo,
                 "--json", "state,labels"
-            )
+            ) -Name "closed pull request issue #$number"
             if ($null -eq $issue) {
                 continue
             }
