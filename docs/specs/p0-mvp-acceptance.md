@@ -133,7 +133,7 @@ P0 验收必须能在 Windows 10 的固定示例 Project 上重复执行。没�
 - [HTML-first 项目与 Deck 合同](https://github.com/1159741258/SHppt/issues/3)：把输入边界具体化。
 - [P0 技术与部署基线](https://github.com/1159741258/SHppt/issues/4)：把 Windows 进程和授权边界具体化。
 - [Annotation 与 iframe Bridge 合同](https://github.com/1159741258/SHppt/issues/5)：把四类 Annotation 和消息协议具体化。
-- [Claude CLI 能力、权限与 AgentRun 合同](https://github.com/1159741258/SHppt/issues/6)：把 AgentRun 的执行和恢复规则具体化。
+- [Claude CLI 能力、权限与 AgentRun 合同](https://github.com/1159741258/SHppt/issues/6)：把 AgentRun 的执行和恢复规则具体化；具体合同见 [Claude CLI 与 AgentRun 合同](./claude-cli-agent-run-contract.md)。
 - [项目状态、持久化与 ArtifactVersion 回退合同](https://github.com/1159741258/SHppt/issues/7)：把版本、冲突和回退具体化。
 - [文件监听、事件与预览刷新合同](https://github.com/1159741258/SHppt/issues/8)：把刷新和一致性具体化。
 - [Windows 10 CLI 与渲染前置条件核验](https://github.com/1159741258/SHppt/issues/9)：核验目标环境事实。

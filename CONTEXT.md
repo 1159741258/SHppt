@@ -54,7 +54,16 @@ _Avoid_: slide index as the durable identity; an index is only the current docum
 A saved user mark containing intent, visual evidence, and the available structural location of a Slide or Stable Element ID.
 
 **AgentRun**:
-One controlled Agent task associated with a saved Annotation and a specific ArtifactVersion.
+One controlled Claude CLI task associated with one saved Annotation, one pinned File Index snapshot, and one expected ArtifactVersion transition. An AgentRun may have a bounded recovery attempt, but it never processes more than one Annotation.
+
+**Project Session**:
+The opaque Claude CLI conversation identity held by the trusted Daemon for one AgentRun and its recovery attempts. In P0 it is not shared between Annotations or Projects; the Session is context, not authorization.
+
+**Turn**:
+One submitted Agent message and the stream of assistant, tool, usage, and terminal events that belong to it. A normal P0 AgentRun has one initial Turn; a recovery uses a new Turn in the same Project Session.
+
+**Hard scope**:
+The Daemon-generated set of Project-relative Paths, Slide IDs, Stable Element IDs, and permitted edit operations for an AgentRun. Prompt instructions cannot expand it, and the Daemon must verify observed changes after the CLI exits.
 
 **ArtifactVersion**:
 A reviewable source-file state associated with a Project change, including enough before/after evidence to inspect or restore it.
