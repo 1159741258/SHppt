@@ -60,10 +60,10 @@ P0 的交付结果是一个可检查、可失败、可回退的修改闭环，�
 ### 预览、确认和回退
 
 - Agent 写入完成后，系统等待文件稳定并刷新预览；刷新失败不能伪装成成功。
-- 用户看到修改后的预览和本次变化的 ArtifactVersion 后，才能确认 Annotation 已解决；版本、确认和回退遵守[项目状态、持久化与 ArtifactVersion 回退合同](./project-state-artifact-version-contract.md)。
+- 用户看到修改后的预览和本次变化的 ArtifactVersion 后，才能确认 Annotation 已解决。
 - 每次被接受的修改都必须保留修改前内容、修改后内容、变更文件和触发 Annotation 的关联。
 - 用户可以回到本次 AgentRun 之前的确切内容；回退后预览必须重新同步，且 Annotation 不能被静默标记为已解决。
-- 修改失败时，Annotation、AgentRun 的失败原因和已有副作用证据必须保留，支持人工处理或安全重试；有副作用但状态不确定时不得盲目重试。
+- 修改失败时，Annotation、AgentRun 的失败原因和已有副作用证据必须保留，支持人工处理或安全重试。
 
 ## 最小状态语义
 
@@ -104,7 +104,7 @@ P0 的交付结果是一个可检查、可失败、可回退的修改闭环，�
 
 ## 验收场景
 
-以下场景构成 P0 的最小验收集；测试夹具、测试工具和证据格式由 [P0 测试、视觉质量与验收证据](https://github.com/1159741258/SHppt/issues/10) 决定。
+以下场景构成 P0 的最小验收集；测试夹具、测试工具和证据格式由 [P0 测试、视觉质量与验收证据](./p0-testing-and-evidence.md) 决定。
 
 - **P0-01 打开 Deck**：用户打开受支持的本地 Project，看到 Slide 预览并能导航。
 - **P0-02 点击标记**：用户点击带稳定标识的元素，看到目标高亮，输入修改要求并保存 Annotation。
@@ -135,6 +135,6 @@ P0 验收必须能在 Windows 10 的固定示例 Project 上重复执行。没�
 - [Annotation 与 iframe Bridge 合同](https://github.com/1159741258/SHppt/issues/5)：把四类 Annotation 和消息协议具体化。
 - [Claude CLI 能力、权限与 AgentRun 合同](https://github.com/1159741258/SHppt/issues/6)：把 AgentRun 的执行和恢复规则具体化。
 - [项目状态、持久化与 ArtifactVersion 回退合同](https://github.com/1159741258/SHppt/issues/7)：把版本、冲突和回退具体化。
-- [文件监听、事件与预览刷新合同](./file-watching-events-preview-refresh-contract.md)：把刷新和一致性具体化。
+- [文件监听、事件与预览刷新合同](https://github.com/1159741258/SHppt/issues/8)：把刷新和一致性具体化。
 - [Windows 10 CLI 与渲染前置条件核验](https://github.com/1159741258/SHppt/issues/9)：核验目标环境事实。
 - [P0 测试、视觉质量与验收证据](https://github.com/1159741258/SHppt/issues/10)：把验收场景落成可重复证据。
