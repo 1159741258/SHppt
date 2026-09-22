@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as zlib from "node:zlib";
-import { canonicalizeContentRoot, getFile, loadOrCreateProjectId, publicSnapshot, readSnapshotFile, scanProject } from "./project.mjs";
+import { canonicalizeContentRoot, getFile, loadOrCreateProjectId, publicSnapshot, readSnapshotFile, scanProject, validateProjectRelativePath } from "./project.mjs";
 import { createRendererHtml, injectBridge } from "./bridge.mjs";
 import { CdpRenderer } from "./cdp-renderer.mjs";
 import { RuntimeError, publicError } from "./errors.mjs";
@@ -80,12 +80,16 @@ export class LocalDaemon {
   }
 
   async rescan() {
+    const previousVersion = this.snapshot?.fileIndexVersion || null;
     try {
       this.snapshot = await scanProject({ contentRoot: this.contentRoot || this.inputContentRoot, projectId: this.projectId || randomUUID() });
       this.scanFailure = null;
+      if (previousVersion !== this.snapshot.fileIndexVersion) this.previewScopes.clear();
       if (this.origin) this.publish("project.scan-ready", { fileIndexVersion: this.snapshot.fileIndexVersion });
       return this.snapshot;
     } catch (error) {
+      this.snapshot = null;
+      this.previewScopes.clear();
       this.scanFailure = publicError(error);
       if (this.origin) this.publish("project.scan-failed", { error: this.scanFailure });
       return null;
@@ -132,6 +136,7 @@ export class LocalDaemon {
 
   async rescanEndpoint(request, response) {
     const body = await readJsonBody(request);
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new RuntimeError("HTTP_JSON_INVALID", "Rescan request must be a JSON object.");
     if (body.projectId !== this.projectId) throw new RuntimeError("PROJECT_ID_MISMATCH", "Project identity did not match the daemon.");
     const snapshot = await this.rescan();
     if (!snapshot) return sendJson(response, 409, { error: this.scanFailure });
@@ -141,9 +146,11 @@ export class LocalDaemon {
   async createPreview(request, response) {
     if (this.scanFailure || !this.snapshot) throw new RuntimeError("PROJECT_SCAN_FAILED", "A valid Project snapshot is required before preview.");
     const body = await readJsonBody(request);
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new RuntimeError("HTTP_JSON_INVALID", "Preview request must be a JSON object.");
     if (body.projectId !== this.snapshot.projectId) throw new RuntimeError("PROJECT_ID_MISMATCH", "Project identity did not match the active snapshot.");
     if (body.fileIndexVersion !== this.snapshot.fileIndexVersion) throw new RuntimeError("PROJECT_VERSION_MISMATCH", "Preview requested an outdated File Index snapshot.");
-    const slideId = String(body.slideId || "");
+    const slideId = body.slideId;
+    if (typeof slideId !== "string") throw new RuntimeError("DECK_SLIDE_INVALID", "Preview requires a Slide ID.");
     const slide = this.snapshot.slides.find((candidate) => candidate.slideId === slideId);
     if (!slide) throw new RuntimeError("DECK_SLIDE_INVALID", "Preview requested an unknown Slide ID.");
     const viewport = normalizeViewport(body.viewport);
@@ -166,13 +173,17 @@ export class LocalDaemon {
       dpr
     };
     this.previewScopes.set(scopeId, scope);
+    const rendererUrl = `${this.origin}/renderer/${scopeId}?session=${encodeURIComponent(previewSessionId)}&iframe=${encodeURIComponent(iframeInstanceId)}&nonce=${encodeURIComponent(bridgeNonce)}&slide=${encodeURIComponent(slideId)}&capture=false`;
+    const captureRendererUrl = `${this.origin}/renderer/${scopeId}?session=${encodeURIComponent(previewSessionId)}&iframe=${encodeURIComponent(iframeInstanceId)}&nonce=${encodeURIComponent(bridgeNonce)}&slide=${encodeURIComponent(slideId)}&capture=true`;
     const preview = {
       previewSessionId,
       iframeInstanceId,
       projectId: this.projectId,
       fileIndexVersion: this.snapshot.fileIndexVersion,
       slideId,
+      rendererUrl,
       status: "loading",
+      state: "loading",
       error: null,
       createdAt: new Date().toISOString(),
       renderingIdentity: null,
@@ -181,12 +192,11 @@ export class LocalDaemon {
       evidenceManifestId: null
     };
     this.previews.set(previewSessionId, preview);
-    this.publish("preview.loading", { previewSessionId, iframeInstanceId, slideId, fileIndexVersion: this.snapshot.fileIndexVersion });
-    const rendererUrl = `${this.origin}/renderer/${scopeId}?session=${encodeURIComponent(previewSessionId)}&iframe=${encodeURIComponent(iframeInstanceId)}&nonce=${encodeURIComponent(bridgeNonce)}&slide=${encodeURIComponent(slideId)}&capture=true`;
+    this.publish("preview.loading", { previewSessionId, iframeInstanceId, slideId, state: "loading", fileIndexVersion: this.snapshot.fileIndexVersion, rendererUrl });
     const screenshotDirectory = path.join(this.evidenceDirectory, this.projectId, previewSessionId);
     try {
       const renderer = new CdpRenderer({ browserName: this.browserName, browserPath: this.browserPath, viewport, dpr, hostOrigin: this.origin });
-      const result = await renderer.render({ rendererUrl, slideIds: [slideId], screenshotDirectory });
+      const result = await renderer.render({ rendererUrl: captureRendererUrl, slideIds: [slideId], screenshotDirectory });
       const observation = validateObservation(result.observation, this.snapshot, scope);
       const screenshotFile = result.screenshots[slideId];
       if (!screenshotFile) throw new RuntimeError("PREVIEW_SCREENSHOT_FAILED", "The renderer did not return a Slide screenshot.");
@@ -230,15 +240,15 @@ export class LocalDaemon {
         renderingIdentity,
         assertions: ["bridge-handshake", "dom-observation", "non-empty-slide", "png-screenshot", "font-and-resource-observation"]
       });
-      Object.assign(preview, { status: "ready", observation, screenshot, renderingIdentity, evidenceManifestId: evidenceManifest.manifestId });
-      this.publish("preview.ready", { previewSessionId, iframeInstanceId, slideId, fileIndexVersion: this.snapshot.fileIndexVersion, evidenceManifestId: evidenceManifest.manifestId });
+      Object.assign(preview, { status: "ready", state: "ready", observation, screenshot, renderingIdentity, evidenceManifestId: evidenceManifest.manifestId });
+      this.publish("preview.ready", { previewSessionId, iframeInstanceId, slideId, state: "ready", fileIndexVersion: this.snapshot.fileIndexVersion, rendererUrl, evidenceManifestId: evidenceManifest.manifestId });
       return sendJson(response, 200, { preview: publicPreview(preview), observation, screenshot, renderingIdentity, evidenceManifest });
     } catch (error) {
       const runtimeError = error instanceof RuntimeError ? error : new RuntimeError("PREVIEW_RENDER_FAILED", "The renderer failed before producing a trustworthy preview.");
       const failure = publicError(runtimeError);
       const evidenceManifest = await this.writeEvidence({ result: "failed", preview, error: failure, assertions: ["preview-ready-gate"] });
-      Object.assign(preview, { status: "error", error: failure, evidenceManifestId: evidenceManifest.manifestId });
-      this.publish("preview.error", { previewSessionId, iframeInstanceId, slideId, error: failure, evidenceManifestId: evidenceManifest.manifestId });
+      Object.assign(preview, { status: "error", state: "error", error: failure, evidenceManifestId: evidenceManifest.manifestId });
+      this.publish("preview.error", { previewSessionId, iframeInstanceId, slideId, state: "error", rendererUrl, error: failure, evidenceManifestId: evidenceManifest.manifestId });
       return sendJson(response, 422, { preview: publicPreview(preview), error: failure, evidenceManifest });
     }
   }
@@ -303,7 +313,8 @@ export class LocalDaemon {
       scopeId: scope.scopeId,
       bridgeNonce: scope.bridgeNonce,
       slideId: scope.slideId,
-      entryUrl: `${this.origin}/preview/${scope.scopeId}/${scope.entryPath}?session=${encodeURIComponent(scope.previewSessionId)}&iframe=${encodeURIComponent(scope.iframeInstanceId)}&nonce=${encodeURIComponent(scope.bridgeNonce)}&slide=${encodeURIComponent(scope.slideId)}`,
+      entryUrl: `${this.origin}/preview/${scope.scopeId}/${encodeProjectPath(scope.entryPath)}?session=${encodeURIComponent(scope.previewSessionId)}&iframe=${encodeURIComponent(scope.iframeInstanceId)}&nonce=${encodeURIComponent(scope.bridgeNonce)}&slide=${encodeURIComponent(scope.slideId)}`,
+      expectedSlideIds: this.snapshot.slides.map((slide) => slide.slideId),
       capture: requestUrl.searchParams.get("capture") === "true",
       origin: this.origin
     });
@@ -330,12 +341,13 @@ export class LocalDaemon {
       const slideId = requestUrl.searchParams.get("slide") || scope.slideId;
       if (slideId !== scope.slideId || !this.snapshot.slides.some((slide) => slide.slideId === slideId)) throw new RuntimeError("DECK_SLIDE_INVALID", "Preview Slide does not match the active scope.");
       const html = injectBridge(bytes.toString("utf8"), {
-        projectId: scope.projectId,
-        fileIndexVersion: scope.fileIndexVersion,
-        previewSessionId: scope.previewSessionId,
-        iframeInstanceId: scope.iframeInstanceId,
-        slideId,
-        bridgeNonce: scope.bridgeNonce,
+         projectId: scope.projectId,
+         fileIndexVersion: scope.fileIndexVersion,
+         previewSessionId: scope.previewSessionId,
+         iframeInstanceId: scope.iframeInstanceId,
+         slideId,
+         expectedSlideIds: this.snapshot.slides.map((slide) => slide.slideId),
+         bridgeNonce: scope.bridgeNonce,
         origin: this.origin
       });
       bytes = Buffer.from(html, "utf8");
@@ -422,11 +434,15 @@ function validateObservation(observation, snapshot, scope) {
   if (!observation || observation.protocol !== "shppt-bridge" || observation.version !== 1 || !Number.isInteger(observation.sequence) || observation.sequence < 1 || observation.projectId !== snapshot.projectId || observation.fileIndexVersion !== snapshot.fileIndexVersion || observation.previewSessionId !== scope.previewSessionId || observation.iframeInstanceId !== scope.iframeInstanceId || observation.activeSlideId !== scope.slideId) {
     throw new RuntimeError("BRIDGE_OBSERVATION_INVALID", "Bridge observation identity did not match the active Project snapshot.");
   }
-  const slideIds = new Set(snapshot.slides.map((slide) => slide.slideId));
-  if (!Array.isArray(observation.slides) || observation.slides.length !== snapshot.slides.length || observation.slides.some((slide) => !slideIds.has(slide.slideId))) throw new RuntimeError("DECK_SLIDE_INVALID", "Bridge observation did not describe the active Deck.");
+  const expectedSlides = snapshot.slides;
+  const slideIds = new Set(expectedSlides.map((slide) => slide.slideId));
+  if (!Array.isArray(observation.slides) || observation.slides.length !== expectedSlides.length || observation.slides.some((slide, index) => !slideIds.has(slide.slideId) || slide.slideId !== expectedSlides[index].slideId || slide.slideIndex !== index || !Number.isFinite(slide.rect?.width) || !Number.isFinite(slide.rect?.height) || slide.rect.width <= 1 || slide.rect.height <= 1) || new Set(observation.slides.map((slide) => slide.slideId)).size !== expectedSlides.length) throw new RuntimeError("DECK_SLIDE_INVALID", "Bridge observation did not describe the active Deck.");
+  const ratios = observation.slides.map((slide) => slide.rect.width / slide.rect.height);
+  if (ratios.some((ratio) => Math.abs(ratio - ratios[0]) > 0.01)) throw new RuntimeError("DECK_SLIDE_SIZE_MISMATCH", "Slide aspect ratios do not match.");
   if (!observation.activeSlideRect || observation.activeSlideRect.width <= 1 || observation.activeSlideRect.height <= 1) throw new RuntimeError("DECK_SLIDE_INVALID", "Active Slide has an empty render rectangle.");
-  const knownIds = new Set(snapshot.slides.flatMap((slide) => slide.stableElementIds));
-  if (!Array.isArray(observation.elements) || observation.elements.some((element) => !knownIds.has(element.stableElementId))) throw new RuntimeError("DECK_ELEMENT_ID_INVALID", "Bridge reported an unknown Stable Element ID.");
+  const activeSlide = expectedSlides.find((slide) => slide.slideId === scope.slideId);
+  const knownIds = new Set(activeSlide?.stableElementIds || []);
+  if (!Array.isArray(observation.elements) || observation.elements.some((element) => !knownIds.has(element.stableElementId) || !Number.isFinite(element.rect?.x) || !Number.isFinite(element.rect?.y) || !Number.isFinite(element.rect?.width) || !Number.isFinite(element.rect?.height)) || new Set(observation.elements.map((element) => element.stableElementId)).size !== observation.elements.length) throw new RuntimeError("DECK_ELEMENT_ID_INVALID", "Bridge reported an unknown or duplicate Stable Element ID.");
   if (observation.images?.some((image) => !image.complete || image.width <= 0 || image.height <= 0)) throw new RuntimeError("PROJECT_RESOURCE_INVALID", "A required image Resource did not load.");
   if (observation.fontReady === false || observation.fontCheck === false) throw new RuntimeError("PROJECT_RESOURCE_INVALID", "The fixed local font did not load.");
   return observation;
@@ -514,6 +530,10 @@ function normalizeDpr(value) {
 
 function decodePath(value) {
   try { return decodeURIComponent(value); } catch { throw new RuntimeError("PROJECT_PATH_ESCAPE", "Preview Resource path is not encoded correctly."); }
+}
+
+function encodeProjectPath(value) {
+  return validateProjectRelativePath(value).split("/").map((segment) => encodeURIComponent(segment)).join("/");
 }
 
 function publicPreview(preview) {
