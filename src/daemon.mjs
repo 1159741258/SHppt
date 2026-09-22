@@ -9,6 +9,7 @@ import { canonicalizeContentRoot, getFile, loadOrCreateProjectId, publicSnapshot
 import { createRendererHtml, injectBridge } from "./bridge.mjs";
 import { CdpRenderer } from "./cdp-renderer.mjs";
 import { RuntimeError, publicError } from "./errors.mjs";
+import { ANNOTATION_SCHEMA_VERSION, createAnnotationV1, publicAnnotation, validateAnnotationV1, validateBridgeCapture } from "./annotation.mjs";
 
 const DEFAULT_BUILD_IDENTITY = "dev-local";
 const MAX_REQUEST_BYTES = 512 * 1024;
@@ -36,6 +37,7 @@ export class LocalDaemon {
     this.port = port;
     this.stateDirectory = stateDirectory || path.join(process.env.LOCALAPPDATA || os.tmpdir(), "SHppt");
     this.evidenceDirectory = evidenceDirectory || path.join(this.stateDirectory, "evidence");
+    this.annotationStatePath = path.join(this.stateDirectory, "annotations.json");
     this.browserName = browserName;
     this.browserPath = browserPath;
     this.buildIdentity = buildIdentity;
@@ -48,6 +50,11 @@ export class LocalDaemon {
     this.previewScopes = new Map();
     this.previews = new Map();
     this.assets = new Map();
+    this.annotations = new Map();
+    this.captureMessages = new Map();
+    this.captureInFlight = new Map();
+    this.annotationPersistChain = Promise.resolve();
+    this.overlayCaptures = new Map();
     this.sseClients = new Set();
     this.streamEpoch = randomUUID();
     this.sequence = 0;
@@ -57,6 +64,7 @@ export class LocalDaemon {
     this.contentRoot = await canonicalizeContentRoot(this.inputContentRoot);
     this.projectId = await loadOrCreateProjectId(this.stateDirectory, this.contentRoot);
     await fs.mkdir(this.evidenceDirectory, { recursive: true });
+    await this.loadAnnotations();
     await this.rescan();
     this.server = http.createServer((request, response) => {
       this.handle(request, response).catch((error) => this.handleError(response, error));
@@ -101,6 +109,9 @@ export class LocalDaemon {
     const pathname = requestUrl.pathname;
     if (pathname === "/health" || pathname === "/api/health") return this.health(response);
     if (pathname === "/api/project" && request.method === "GET") return this.project(response);
+    if ((pathname === "/api/annotations" || pathname === "/api/annotations/capture") && request.method === "GET") return this.listAnnotations(requestUrl, response);
+    if ((pathname === "/api/annotations" || pathname === "/api/annotations/capture") && request.method === "POST") return this.createAnnotation(request, response);
+    if (pathname.startsWith("/api/annotations/") && request.method === "GET") return this.annotationStatus(pathname, response);
     if (pathname === "/api/events" && request.method === "GET") return this.events(request, response);
     if (pathname === "/api/preview" && request.method === "POST") return this.createPreview(request, response);
     if (pathname === "/api/rescan" && request.method === "POST") return this.rescanEndpoint(request, response);
@@ -130,8 +141,182 @@ export class LocalDaemon {
     if (this.scanFailure || !this.snapshot) return sendJson(response, 409, { error: this.scanFailure || { code: "PROJECT_SCAN_FAILED", message: "Project scan has not succeeded.", details: {} } });
     return sendJson(response, 200, {
       project: publicSnapshot(this.snapshot),
-      preview: { state: "idle", ready: false, renderer: "cdp" }
+      preview: { state: "idle", ready: false, renderer: "cdp" },
+      annotations: this.publicAnnotations()
     });
+  }
+
+  async loadAnnotations() {
+    let stored;
+    try {
+      stored = JSON.parse(await fs.readFile(this.annotationStatePath, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw new RuntimeError("ANNOTATION_STATE_INVALID", "Trusted Annotation state cannot be read.");
+      return;
+    }
+    const records = Array.isArray(stored) ? stored : stored?.annotations;
+    if (!Array.isArray(records)) return;
+    for (const record of records) {
+      const annotation = record?.annotation || record;
+      try {
+        validateAnnotationV1(annotation);
+        if (annotation.projectId !== this.projectId) continue;
+        this.annotations.set(annotation.annotationId, annotation);
+        const messageId = annotation.capture?.messageId;
+        const ack = { status: "accepted", annotationId: annotation.annotationId, messageId };
+        if (messageId) this.captureMessages.set(messageId, ack);
+        const evidenceFile = record?.evidenceFile;
+        if (typeof evidenceFile !== "string" || path.isAbsolute(evidenceFile) || evidenceFile.includes("..")) continue;
+        const assetPath = path.resolve(this.evidenceDirectory, evidenceFile);
+        const relative = path.relative(this.evidenceDirectory, assetPath);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
+        await fs.access(assetPath);
+        this.assets.set(annotation.evidence.screenshot.assetId, { path: assetPath, mediaType: "image/png", screenshot: annotation.evidence.screenshot });
+      } catch {
+        // Ignore invalid historical records; a new capture remains possible.
+      }
+    }
+  }
+
+  async persistAnnotations() {
+    const write = async () => {
+      await fs.mkdir(this.stateDirectory, { recursive: true });
+      const records = [...this.annotations.values()].map((annotation) => {
+        const asset = this.assets.get(annotation.evidence.screenshot.assetId);
+        const evidenceFile = asset?.path ? path.relative(this.evidenceDirectory, asset.path).split(path.sep).join("/") : null;
+        return { annotation, evidenceFile };
+      });
+      const temporaryPath = `${this.annotationStatePath}.${process.pid}.tmp`;
+      await fs.writeFile(temporaryPath, `${JSON.stringify({ schemaVersion: ANNOTATION_SCHEMA_VERSION, annotations: records }, null, 2)}\n`, "utf8");
+      await fs.rename(temporaryPath, this.annotationStatePath);
+    };
+    this.annotationPersistChain = this.annotationPersistChain.then(write, write);
+    await this.annotationPersistChain;
+  }
+
+  publicAnnotations(fileIndexVersion = null) {
+    return [...this.annotations.values()]
+      .filter((annotation) => !fileIndexVersion || annotation.fileIndexVersion === fileIndexVersion)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((annotation) => publicAnnotation(annotation));
+  }
+
+  listAnnotations(requestUrl, response) {
+    if (requestUrl.searchParams.get("projectId") !== this.projectId) throw new RuntimeError("PROJECT_ID_MISMATCH", "Annotation Project identity did not match the daemon.");
+    const requestedVersion = requestUrl.searchParams.get("fileIndexVersion");
+    if (requestedVersion && requestedVersion !== this.snapshot?.fileIndexVersion) throw new RuntimeError("PROJECT_VERSION_MISMATCH", "Annotation query used an outdated File Index snapshot.");
+    return sendJson(response, 200, {
+      schemaVersion: ANNOTATION_SCHEMA_VERSION,
+      projectId: this.projectId,
+      fileIndexVersion: this.snapshot?.fileIndexVersion || null,
+      annotations: this.publicAnnotations(requestedVersion)
+    });
+  }
+
+  annotationStatus(pathname, response) {
+    const annotationId = decodeURIComponent(pathname.slice("/api/annotations/".length));
+    const annotation = this.annotations.get(annotationId);
+    if (!annotation) return sendJson(response, 404, { error: { code: "ANNOTATION_NOT_FOUND", message: "Annotation was not found.", details: {} } });
+    return sendJson(response, 200, { annotation: publicAnnotation(annotation) });
+  }
+
+  async createAnnotation(request, response) {
+    let body = null;
+    try {
+      body = await readJsonBody(request);
+      const result = await this.captureAnnotation(body);
+      return sendJson(response, result.ack.status === "duplicate" ? 200 : 201, result);
+    } catch (error) {
+      const failure = publicError(error);
+      const messageId = body?.capture?.messageId || body?.messageId || null;
+      const status = ["PROJECT_VERSION_MISMATCH", "PROJECT_ID_MISMATCH", "BRIDGE_SESSION_INVALID"].includes(failure.code) ? 409 : 400;
+      return sendJson(response, status, { ack: { status: "rejected", messageId, error: failure }, error: failure });
+    }
+  }
+
+  async captureAnnotation(body) {
+    if (this.scanFailure || !this.snapshot) throw new RuntimeError("PROJECT_SCAN_FAILED", "A valid Project snapshot is required before saving an Annotation.");
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new RuntimeError("HTTP_JSON_INVALID", "Annotation request must be a JSON object.");
+    const capture = body.capture || body.message || body;
+    const messageId = capture?.messageId;
+    const previous = messageId && this.captureMessages.get(messageId);
+    if (previous) return { ack: { ...previous, status: "duplicate" }, annotation: previous.annotationId ? publicAnnotation(this.annotations.get(previous.annotationId)) : null };
+    if (messageId && this.captureInFlight.has(messageId)) return this.captureInFlight.get(messageId);
+    const operation = this.saveAnnotationCapture(capture);
+    if (messageId) this.captureInFlight.set(messageId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (messageId) this.captureInFlight.delete(messageId);
+    }
+  }
+
+  async saveAnnotationCapture(capture) {
+    if (capture?.projectId !== this.projectId) throw new RuntimeError("PROJECT_ID_MISMATCH", "Annotation Project identity did not match the daemon.");
+    if (capture?.fileIndexVersion !== this.snapshot.fileIndexVersion) throw new RuntimeError("PROJECT_VERSION_MISMATCH", "Annotation used an outdated File Index snapshot.");
+    const scope = [...this.previewScopes.values()].find((candidate) => candidate.previewSessionId === capture.previewSessionId && candidate.iframeInstanceId === capture.iframeInstanceId && candidate.projectId === this.projectId);
+    if (!scope || scope.expiresAt < Date.now()) throw new RuntimeError("BRIDGE_SESSION_INVALID", "Annotation capture did not match a live preview session.");
+    const slide = this.snapshot.slides.find((candidate) => candidate.slideId === scope.slideId);
+    if (!slide) throw new RuntimeError("DECK_SLIDE_INVALID", "Annotation capture Slide is not in the active Deck.");
+    const normalizedCapture = validateBridgeCapture(capture, {
+      projectId: this.projectId,
+      fileIndexVersion: this.snapshot.fileIndexVersion,
+      slideId: scope.slideId,
+      origin: this.origin,
+      nonce: scope.bridgeNonce,
+      lastSequence: scope.lastBridgeSequence || 0,
+      knownStableElementIds: new Set(slide.stableElementIds),
+      elementOrder: slide.stableElementIds
+    });
+    const sourceFile = getFile(this.snapshot, slide.sourcePath);
+    if (!sourceFile) throw new RuntimeError("PROJECT_VERSION_MISMATCH", "Annotation source file is not in the active File Index.");
+    scope.lastBridgeSequence = normalizedCapture.sequence;
+    const evidence = await this.captureAnnotationEvidence({ scope, capture: normalizedCapture });
+    const annotation = createAnnotationV1({
+      capture: normalizedCapture,
+      slide,
+      sourcePath: slide.sourcePath,
+      contentHash: sourceFile.contentHash,
+      screenshot: evidence.screenshot,
+      evidenceManifestId: evidence.evidenceManifest.manifestId,
+      renderingIdentity: evidence.renderingIdentity
+    });
+    this.annotations.set(annotation.annotationId, annotation);
+    this.assets.set(annotation.evidence.screenshot.assetId, { path: evidence.assetPath, mediaType: "image/png", screenshot: annotation.evidence.screenshot });
+    await this.persistAnnotations();
+    const ack = { status: "accepted", annotationId: annotation.annotationId, messageId: normalizedCapture.messageId };
+    this.captureMessages.set(normalizedCapture.messageId, ack);
+    this.publish("annotation.captured", { annotation: publicAnnotation(annotation), previewSessionId: normalizedCapture.previewSessionId, iframeInstanceId: normalizedCapture.iframeInstanceId });
+    return { ack, annotation: publicAnnotation(annotation), evidenceManifest: evidence.evidenceManifest };
+  }
+
+  async captureAnnotationEvidence({ scope, capture }) {
+    const overlayId = randomUUID();
+    const overlay = { geometry: capture.geometry, memberRects: capture.domContext.members.map((member) => member.rect).filter(Boolean) };
+    this.overlayCaptures.set(overlayId, { scopeId: scope.scopeId, overlay });
+    const directory = path.join(this.evidenceDirectory, this.projectId, "annotations");
+    await fs.mkdir(directory, { recursive: true });
+    const rendererUrl = `${this.origin}/renderer/${scope.scopeId}?session=${encodeURIComponent(scope.previewSessionId)}&iframe=${encodeURIComponent(scope.iframeInstanceId)}&nonce=${encodeURIComponent(scope.bridgeNonce)}&slide=${encodeURIComponent(scope.slideId)}&capture=true&overlay=${encodeURIComponent(overlayId)}`;
+    try {
+      const renderer = new CdpRenderer({ browserName: this.browserName, browserPath: this.browserPath, viewport: scope.viewport, dpr: scope.dpr, hostOrigin: this.origin });
+      const result = await renderer.render({ rendererUrl, slideIds: [scope.slideId], screenshotDirectory: directory });
+      const observation = validateObservation(result.observation, this.snapshot, scope);
+      const screenshotFile = result.screenshots[scope.slideId];
+      if (!screenshotFile) throw new RuntimeError("ANNOTATION_SCREENSHOT_FAILED", "The renderer did not return an Annotation screenshot.");
+      const bytes = await fs.readFile(screenshotFile.path);
+      const png = inspectPng(bytes, Math.round(scope.viewport.width * scope.dpr), Math.round(scope.viewport.height * scope.dpr));
+      if (!png.valid || !png.nonEmpty) throw new RuntimeError("ANNOTATION_SCREENSHOT_INVALID", "The Annotation screenshot was invalid or empty.", { width: png.width, height: png.height });
+      const assetId = randomUUID();
+      const assetPath = path.join(directory, `${scope.slideId}-${assetId}.png`);
+      await fs.writeFile(assetPath, bytes);
+      const screenshot = { assetId, mediaType: "image/png", byteLength: bytes.length, sha256: `sha256:${sha256(bytes)}`, width: png.width, height: png.height, overlay: true };
+      const preview = { projectId: this.projectId, fileIndexVersion: this.snapshot.fileIndexVersion, slideId: scope.slideId, previewSessionId: scope.previewSessionId, iframeInstanceId: scope.iframeInstanceId };
+      const renderingIdentity = { os: `${os.platform()} ${os.release()} ${os.arch()}`, node: process.version, browser: result.browserVersion?.Browser || `${this.browserName} unknown`, browserProtocol: result.browserVersion?.["Protocol-Version"] || null, renderingMode: "cdp-headless", viewport: scope.viewport, dpr: scope.dpr, fontHash: this.snapshot.files.find((file) => file.kind === "font")?.contentHash || null, fixtureHash: this.snapshot.fixtureHash, buildIdentity: this.buildIdentity, projectId: this.projectId, fileIndexVersion: this.snapshot.fileIndexVersion, entryPath: this.snapshot.entryPath, slideId: scope.slideId };
+      const evidenceManifest = await this.writeEvidence({ command: "annotation-capture", result: "passed", preview, observation, screenshot, renderingIdentity, assertions: ["bridge-session", "annotation-target", "overlay-screenshot", "png-screenshot"] });
+      return { assetPath, screenshot, evidenceManifest, renderingIdentity };
+    } finally {
+      this.overlayCaptures.delete(overlayId);
+    }
   }
 
   async rescanEndpoint(request, response) {
@@ -170,7 +355,8 @@ export class LocalDaemon {
       bridgeNonce,
       expiresAt: Date.now() + 5 * 60 * 1000,
       viewport,
-      dpr
+      dpr,
+      lastBridgeSequence: 0
     };
     this.previewScopes.set(scopeId, scope);
     const rendererUrl = `${this.origin}/renderer/${scopeId}?session=${encodeURIComponent(previewSessionId)}&iframe=${encodeURIComponent(iframeInstanceId)}&nonce=${encodeURIComponent(bridgeNonce)}&slide=${encodeURIComponent(slideId)}&capture=false`;
@@ -198,6 +384,7 @@ export class LocalDaemon {
       const renderer = new CdpRenderer({ browserName: this.browserName, browserPath: this.browserPath, viewport, dpr, hostOrigin: this.origin });
       const result = await renderer.render({ rendererUrl: captureRendererUrl, slideIds: [slideId], screenshotDirectory });
       const observation = validateObservation(result.observation, this.snapshot, scope);
+      scope.lastBridgeSequence = observation.sequence;
       const screenshotFile = result.screenshots[slideId];
       if (!screenshotFile) throw new RuntimeError("PREVIEW_SCREENSHOT_FAILED", "The renderer did not return a Slide screenshot.");
       const screenshotBytes = await fs.readFile(screenshotFile.path);
@@ -270,7 +457,7 @@ export class LocalDaemon {
     response.write(`retry: 1000\n\n`);
     const client = { response, heartbeat: setInterval(() => response.write(": heartbeat\n\n"), 15000) };
     this.sseClients.add(client);
-    response.write(`event: subscription.snapshot\ndata: ${JSON.stringify({ schemaVersion: 1, streamEpoch: this.streamEpoch, sequence: this.sequence, project: this.snapshot ? publicSnapshot(this.snapshot) : null, error: this.scanFailure })}\n\n`);
+    response.write(`event: subscription.snapshot\ndata: ${JSON.stringify({ schemaVersion: 1, streamEpoch: this.streamEpoch, sequence: this.sequence, project: this.snapshot ? publicSnapshot(this.snapshot) : null, annotations: this.publicAnnotations(), error: this.scanFailure })}\n\n`);
     request.on("close", () => {
       clearInterval(client.heartbeat);
       this.sseClients.delete(client);
@@ -303,6 +490,9 @@ export class LocalDaemon {
   async rendererDocument(pathname, requestUrl, response) {
     const scope = this.scopeForPath(pathname);
     this.assertScopeQuery(scope, requestUrl.searchParams);
+    const overlayId = requestUrl.searchParams.get("overlay");
+    const overlayCapture = overlayId ? this.overlayCaptures.get(overlayId) : null;
+    if (overlayId && (!overlayCapture || overlayCapture.scopeId !== scope.scopeId)) throw new RuntimeError("ANNOTATION_EVIDENCE_INVALID", "Annotation overlay scope is invalid.");
     const html = createRendererHtml({
       protocol: "shppt-bridge",
       version: 1,
@@ -315,6 +505,8 @@ export class LocalDaemon {
       slideId: scope.slideId,
       entryUrl: `${this.origin}/preview/${scope.scopeId}/${encodeProjectPath(scope.entryPath)}?session=${encodeURIComponent(scope.previewSessionId)}&iframe=${encodeURIComponent(scope.iframeInstanceId)}&nonce=${encodeURIComponent(scope.bridgeNonce)}&slide=${encodeURIComponent(scope.slideId)}`,
       expectedSlideIds: this.snapshot.slides.map((slide) => slide.slideId),
+      annotationApi: `${this.origin}/api/annotations`,
+      overlay: overlayCapture?.overlay || null,
       capture: requestUrl.searchParams.get("capture") === "true",
       origin: this.origin
     });
@@ -381,14 +573,14 @@ export class LocalDaemon {
     if (requireSlide && searchParams.get("slide") !== scope.slideId) throw new RuntimeError("PREVIEW_SCOPE_INVALID", "Preview Slide did not match its scope.");
   }
 
-  async writeEvidence({ result, preview, observation = null, screenshot = null, renderingIdentity = null, error = null, assertions = [] }) {
+  async writeEvidence({ command = "preview", result, preview, observation = null, screenshot = null, renderingIdentity = null, error = null, assertions = [] }) {
     const manifestId = randomUUID();
     const manifest = {
       schemaVersion: 1,
       manifestId,
       result,
       exitCode: result === "passed" ? 0 : null,
-      command: "preview",
+      command,
       buildIdentity: this.buildIdentity,
       projectId: preview.projectId,
       fileIndexVersion: preview.fileIndexVersion,
