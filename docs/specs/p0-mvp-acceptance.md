@@ -60,10 +60,10 @@ P0 的交付结果是一个可检查、可失败、可回退的修改闭环，�
 ### 预览、确认和回退
 
 - Agent 写入完成后，系统等待文件稳定并刷新预览；刷新失败不能伪装成成功。
-- 用户看到修改后的预览和本次变化的 ArtifactVersion 后，才能确认 Annotation 已解决。
+- 用户看到修改后的预览和本次变化的 ArtifactVersion 后，才能确认 Annotation 已解决；版本、确认和回退遵守[项目状态、持久化与 ArtifactVersion 回退合同](./project-state-artifact-version-contract.md)。
 - 每次被接受的修改都必须保留修改前内容、修改后内容、变更文件和触发 Annotation 的关联。
 - 用户可以回到本次 AgentRun 之前的确切内容；回退后预览必须重新同步，且 Annotation 不能被静默标记为已解决。
-- 修改失败时，Annotation、AgentRun 的失败原因和已有副作用证据必须保留，支持人工处理或安全重试。
+- 修改失败时，Annotation、AgentRun 的失败原因和已有副作用证据必须保留，支持人工处理或安全重试；有副作用但状态不确定时不得盲目重试。
 
 ## 最小状态语义
 

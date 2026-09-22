@@ -59,11 +59,8 @@ One controlled Agent task associated with a saved Annotation and a specific Arti
 **Project Session**:
 The durable conversation context that may connect multiple AgentRuns for one Project and one Agent provider. It is not the Claude CLI process itself; its provider session identity can be replaced only through an explicit new-session decision.
 
-**Turn**:
-One model interaction inside an AgentRun. A Turn has its own streamed events and terminal result; in P0, one AgentRun contains exactly one Turn.
-
-**Hard Scope**:
-The explicit Slide, Stable Element ID, Project-relative Path, and change-kind boundary an AgentRun is allowed to use. A user note cannot widen a Hard Scope.
+**User Confirmation**:
+An explicit persisted decision to accept or roll back a reviewable ArtifactVersion. It is separate from Annotation status and never rewrites historical versions or evidence.
 
 **ArtifactVersion**:
-A reviewable source-file state associated with a Project change, including enough before/after evidence to inspect or restore it.
+A reviewable Project source-file state associated with a Project change, including its File Index reference and enough before/after evidence to inspect or restore the affected paths.
