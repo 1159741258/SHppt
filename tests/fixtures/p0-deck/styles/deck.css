@@ -1,0 +1,104 @@
+@font-face {
+  font-family: "Fixture Sans";
+  src: url("../assets/fixture-font.woff2") format("woff2");
+  font-display: block;
+}
+
+:root {
+  color-scheme: dark;
+  font-family: "Fixture Sans", sans-serif;
+  background: #10161f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+.deck-shell {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  color: #f7f9fb;
+  background: #10161f;
+}
+
+.slide {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  min-width: 640px;
+  min-height: 360px;
+  padding: 9vw;
+  overflow: hidden;
+  background: #10161f;
+}
+
+.cover-slide {
+  display: grid;
+  align-content: center;
+  gap: 1.5rem;
+  background: linear-gradient(135deg, #10161f 0%, #1b3140 100%);
+}
+
+.detail-slide {
+  display: grid;
+  grid-template-columns: 1fr 0.8fr;
+  align-items: center;
+  gap: 4rem;
+  background: #f0eadf;
+  color: #1c252c;
+}
+
+.eyebrow {
+  color: #77d4bb;
+  font-size: clamp(0.75rem, 1.25vw, 1rem);
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+
+h1,
+h2,
+p {
+  max-width: 34ch;
+  margin: 0;
+}
+
+h1 {
+  max-width: 12ch;
+  font-size: clamp(3rem, 7vw, 7rem);
+  line-height: 0.95;
+}
+
+h2 {
+  max-width: 12ch;
+  font-size: clamp(2.5rem, 5vw, 5.5rem);
+  line-height: 0.98;
+}
+
+p {
+  color: #b7c2cc;
+  font-size: clamp(1rem, 1.8vw, 1.5rem);
+  line-height: 1.45;
+}
+
+.detail-slide p {
+  color: #53616b;
+}
+
+.cover-rule {
+  width: 30vw;
+  height: 0.35rem;
+  background: #e3b35b;
+}
+
+.detail-mark {
+  width: min(26vw, 20rem);
+  justify-self: center;
+  filter: drop-shadow(0 1.25rem 1.5rem rgb(28 37 44 / 18%));
+}
