@@ -263,9 +263,9 @@ P0 至少要能重复证明以下场景：
 
 ## 11. 与后续合同的边界
 
-- #4 决定 Browser/Renderer、Daemon 和 Electron 的进程边界；具体见 [ADR-0002](../adr/0002-p0-runtime-and-deployment-boundary.md)。本合同只要求 Daemon 持有 Content Root 访问权。
+- #4 决定 Browser/Renderer、Daemon 和 Electron 的进程边界；本合同只要求 Daemon 持有 Content Root 访问权。
 - #5 使用这里定义的 Slide ID、Stable Element ID、Project-relative Path 和 File Index 建立 Annotation/iframe Bridge 消息。
 - #6 在本合同的 Content Root 之外继续定义 AgentRun 的逻辑 Hard scope 和允许写入文件；任何逻辑范围都不能突破这里的物理边界。
 - #7 为 `projectId`、`entryPath`、contentHash 和后续 ArtifactVersion 规定持久化与回退关联。
-- #8 使用同一 File Index 的路径和版本信息生成文件事件与预览刷新。
+- [#8 文件监听、事件与预览刷新合同](./file-watching-events-preview-refresh-contract.md)使用同一 File Index 的路径和版本信息生成文件事件与预览刷新。
 - #10 为上述验收场景提供夹具、测试和诊断证据。
