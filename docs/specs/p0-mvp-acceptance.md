@@ -4,6 +4,8 @@
 
 本文件落实 [P0 闭环边界与验收合同](https://github.com/1159741258/SHppt/issues/2)。它只定义首个可交付闭环的产品行为；运行时、数据存储和消息协议的具体设计由后续决策票据展开。
 
+Claude CLI 的能力探测、权限、Project Session、AgentRun、Turn、流事件和恢复规则由 [P0 Claude CLI 与 AgentRun 合同](./claude-cli-agent-run-contract.md) 决定。该合同不能放宽本文件的 P0 成功条件或范围边界。
+
 ## 决策
 
 P0 是一个 Windows 10 本地、单用户、HTML-first 的 Agent PPT 编辑器。它交付下面这条闭环：
@@ -133,7 +135,7 @@ P0 验收必须能在 Windows 10 的固定示例 Project 上重复执行。没�
 - [HTML-first 项目与 Deck 合同](https://github.com/1159741258/SHppt/issues/3)：把输入边界具体化。
 - [P0 技术与部署基线](https://github.com/1159741258/SHppt/issues/4)：把 Windows 进程和授权边界具体化。
 - [Annotation 与 iframe Bridge 合同](https://github.com/1159741258/SHppt/issues/5)：把四类 Annotation 和消息协议具体化。
-- [Claude CLI 能力、权限与 AgentRun 合同](https://github.com/1159741258/SHppt/issues/6)：把 AgentRun 的执行和恢复规则具体化。
+- [Claude CLI 能力、权限与 AgentRun 合同](https://github.com/1159741258/SHppt/issues/6)：把 AgentRun 的执行和恢复规则具体化；合同见 [Claude CLI 与 AgentRun 合同](./claude-cli-agent-run-contract.md)。
 - [项目状态、持久化与 ArtifactVersion 回退合同](https://github.com/1159741258/SHppt/issues/7)：把版本、冲突和回退具体化。
 - [文件监听、事件与预览刷新合同](https://github.com/1159741258/SHppt/issues/8)：把刷新和一致性具体化。
 - [Windows 10 CLI 与渲染前置条件核验](https://github.com/1159741258/SHppt/issues/9)：核验目标环境事实。
