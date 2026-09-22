@@ -4,8 +4,6 @@
 
 本文件落实 [P0 闭环边界与验收合同](https://github.com/1159741258/SHppt/issues/2)。它只定义首个可交付闭环的产品行为；运行时、数据存储和消息协议的具体设计由后续决策票据展开。
 
-Claude CLI 的能力探测、权限、Project Session、AgentRun、Turn、流事件和恢复规则由 [P0 Claude CLI 与 AgentRun 合同](./claude-cli-agent-run-contract.md) 决定。该合同不能放宽本文件的 P0 成功条件或范围边界。
-
 ## 决策
 
 P0 是一个 Windows 10 本地、单用户、HTML-first 的 Agent PPT 编辑器。它交付下面这条闭环：
@@ -62,10 +60,10 @@ P0 的交付结果是一个可检查、可失败、可回退的修改闭环，�
 ### 预览、确认和回退
 
 - Agent 写入完成后，系统等待文件稳定并刷新预览；刷新失败不能伪装成成功。
-- 用户看到修改后的预览和本次变化的 ArtifactVersion 后，才能确认 Annotation 已解决。
+- 用户看到修改后的预览和本次变化的 ArtifactVersion 后，才能确认 Annotation 已解决；版本、确认和回退遵守[项目状态、持久化与 ArtifactVersion 回退合同](./project-state-artifact-version-contract.md)。
 - 每次被接受的修改都必须保留修改前内容、修改后内容、变更文件和触发 Annotation 的关联。
 - 用户可以回到本次 AgentRun 之前的确切内容；回退后预览必须重新同步，且 Annotation 不能被静默标记为已解决。
-- 修改失败时，Annotation、AgentRun 的失败原因和已有副作用证据必须保留，支持人工处理或安全重试。
+- 修改失败时，Annotation、AgentRun 的失败原因和已有副作用证据必须保留，支持人工处理或安全重试；有副作用但状态不确定时不得盲目重试。
 
 ## 最小状态语义
 
@@ -135,7 +133,7 @@ P0 验收必须能在 Windows 10 的固定示例 Project 上重复执行。没�
 - [HTML-first 项目与 Deck 合同](https://github.com/1159741258/SHppt/issues/3)：把输入边界具体化。
 - [P0 技术与部署基线](https://github.com/1159741258/SHppt/issues/4)：把 Windows 进程和授权边界具体化。
 - [Annotation 与 iframe Bridge 合同](https://github.com/1159741258/SHppt/issues/5)：把四类 Annotation 和消息协议具体化。
-- [Claude CLI 能力、权限与 AgentRun 合同](https://github.com/1159741258/SHppt/issues/6)：把 AgentRun 的执行和恢复规则具体化；合同见 [Claude CLI 与 AgentRun 合同](./claude-cli-agent-run-contract.md)。
+- [Claude CLI 能力、权限与 AgentRun 合同](https://github.com/1159741258/SHppt/issues/6)：把 AgentRun 的执行和恢复规则具体化。
 - [项目状态、持久化与 ArtifactVersion 回退合同](https://github.com/1159741258/SHppt/issues/7)：把版本、冲突和回退具体化。
 - [文件监听、事件与预览刷新合同](https://github.com/1159741258/SHppt/issues/8)：把刷新和一致性具体化。
 - [Windows 10 CLI 与渲染前置条件核验](https://github.com/1159741258/SHppt/issues/9)：核验目标环境事实。
