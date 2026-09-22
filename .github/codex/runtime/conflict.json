@@ -1,0 +1,13 @@
+{
+  "pullRequestNumber": 14,
+  "baseRef": "main",
+  "baseSha": "14b9d0d6b5568ce025a8282ce7c2de141b249333",
+  "headRef": "codex/issue-7-20260922121735-65fccb5b",
+  "headSha": "0d480ba813383ea2dc8af7b9cb39fdc75256c561",
+  "mergeBaseSha": "50d8b9c5ef918deb8a80201d7e1704784bf19782",
+  "syntheticOursBranch": "codex-conflict-14-ours-4232c3bfd11d45a4ad4fe7ed76f0f8d2",
+  "syntheticTheirsBranch": "codex-conflict-14-theirs-4232c3bfd11d45a4ad4fe7ed76f0f8d2",
+  "unresolvedPaths": [
+    "docs/specs/html-first-project-deck-contract.md"
+  ]
+}
