@@ -1,3 +1,5 @@
+import { CAPTURE_BOX, CAPTURE_CLICK } from "./annotation.mjs";
+
 export const BRIDGE_PROTOCOL = "shppt-bridge";
 export const BRIDGE_VERSION = 1;
 
@@ -29,10 +31,15 @@ export function createBridgeScript(config) {
   const REQUEST = "od:bridge:request-observation";
   const OBSERVATION = "od:bridge:observation";
   const ACTIVATE = "od:bridge:activate-slide";
+  const SET_CAPTURE_MODE = "od:bridge:set-capture-mode";
+  const CAPTURE_ACK = "od:bridge:capture-ack";
+  const CAPTURE_ERROR = "od:bridge:capture-error";
   let port = null;
   let activeSlideId = config.slideId;
   let sequence = 0;
   let slideFacts = [];
+  let captureMode = null;
+  let drag = null;
 
   function token(value) {
     return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(value);
@@ -104,6 +111,8 @@ export function createBridgeScript(config) {
       protocol: config.protocol,
       version: config.version,
       type: OBSERVATION,
+      source: "preview",
+      transport: "MessagePort",
       nonce: config.nonce,
       projectId: config.projectId,
       fileIndexVersion: config.fileIndexVersion,
@@ -133,10 +142,141 @@ export function createBridgeScript(config) {
 
   function onPortMessage(event) {
     const message = event.data || {};
-    if (message.protocol !== config.protocol || message.version !== config.version || message.nonce !== config.nonce) return;
+    if (message.protocol !== config.protocol || message.version !== config.version || message.nonce !== config.nonce || message.source !== "host") return;
     if (message.type === REQUEST) send(observation());
     if (message.type === ACTIVATE && token(message.slideId) && activate(message.slideId)) send(observation());
+    if (message.type === SET_CAPTURE_MODE) {
+      if (message.mode !== null && message.mode !== "click" && message.mode !== "box") {
+        send({ protocol: config.protocol, version: config.version, type: CAPTURE_ERROR, source: "preview", transport: "MessagePort", nonce: config.nonce, code: "BRIDGE_CAPTURE_MODE_INVALID", message: "Capture mode is invalid." });
+      } else {
+        captureMode = message.mode;
+        drag = null;
+        send({ protocol: config.protocol, version: config.version, type: CAPTURE_ACK, source: "preview", transport: "MessagePort", nonce: config.nonce, status: "mode", mode: captureMode });
+      }
+    }
   }
+
+  function boundedText(value, limit) {
+    return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+  }
+
+  function normalizedRect(rect, slideRect) {
+    const x = slideRect.width ? Math.max(0, Math.min(1, (rect.left - slideRect.left) / slideRect.width)) : 0;
+    const y = slideRect.height ? Math.max(0, Math.min(1, (rect.top - slideRect.top) / slideRect.height)) : 0;
+    return {
+      x: x,
+      y: y,
+      width: slideRect.width ? Math.min(1 - x, Math.max(0, rect.width / slideRect.width)) : 0,
+      height: slideRect.height ? Math.min(1 - y, Math.max(0, rect.height / slideRect.height)) : 0
+    };
+  }
+
+  function contextFor(element, slideRect) {
+    const ancestors = [];
+    let current = element.parentElement;
+    while (current && current !== document.body && ancestors.length < 8) {
+      ancestors.push({
+        stableElementId: current.getAttribute("data-od-id") || null,
+        tagName: current.tagName.toLowerCase(),
+        text: boundedText(current.textContent, 240)
+      });
+      if (current === document.querySelector('[data-od-slide="' + CSS.escape(activeSlideId) + '"]')) break;
+      current = current.parentElement;
+    }
+    const rect = element.getBoundingClientRect();
+    return {
+      stableElementId: element.getAttribute("data-od-id"),
+      tagName: element.tagName.toLowerCase(),
+      role: element.getAttribute("role") || "",
+      text: boundedText(element.textContent, 240),
+      rect: normalizedRect(rect, slideRect),
+      ancestors: ancestors
+    };
+  }
+
+  function activeRoot() {
+    return slideRoots().find(function (element) { return element.getAttribute("data-od-slide") === activeSlideId; }) || null;
+  }
+
+  function sendCapture(type, geometry, stableElementIds, domContext) {
+    if (!port || !captureMode) return;
+    sequence += 1;
+    send({
+      protocol: config.protocol,
+      version: config.version,
+      type: type,
+      source: "preview",
+      transport: "MessagePort",
+      origin: config.origin,
+      nonce: config.nonce,
+      projectId: config.projectId,
+      fileIndexVersion: config.fileIndexVersion,
+      previewSessionId: config.previewSessionId,
+      iframeInstanceId: config.iframeInstanceId,
+      slideId: activeSlideId,
+      sequence: sequence,
+      messageId: config.iframeInstanceId + ":capture:" + sequence,
+      geometry: geometry,
+      stableElementId: type === CAPTURE_CLICK ? stableElementIds[0] : undefined,
+      stableElementIds: type === CAPTURE_BOX ? stableElementIds : undefined,
+      domContext: domContext
+    });
+    captureMode = null;
+  }
+
+  function pointInRect(x, y, rect) {
+    return x >= rect.left && y >= rect.top && x <= rect.right && y <= rect.bottom;
+  }
+
+  function intersects(a, b) {
+    return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  }
+
+  document.addEventListener("click", function (event) {
+    if (captureMode !== "click") return;
+    const root = activeRoot();
+    const slideRect = root && root.getBoundingClientRect();
+    const target = event.target && event.target.closest ? event.target.closest("[data-od-id]") : null;
+    if (!root || !slideRect || !target || !root.contains(target)) {
+      if (port) port.postMessage({ protocol: config.protocol, version: config.version, type: CAPTURE_ERROR, source: "preview", transport: "MessagePort", nonce: config.nonce, code: "BRIDGE_CAPTURE_TARGET_MISSING", message: "Click did not identify a Stable Element ID." });
+      return;
+    }
+    event.preventDefault();
+    const geometry = normalizedRect(target.getBoundingClientRect(), slideRect);
+    const context = contextFor(target, slideRect);
+    sendCapture(CAPTURE_CLICK, geometry, [target.getAttribute("data-od-id")], { target: context, ancestors: context.ancestors });
+  }, true);
+
+  document.addEventListener("pointerdown", function (event) {
+    if (captureMode !== "box") return;
+    const root = activeRoot();
+    const rect = root && root.getBoundingClientRect();
+    if (!root || !rect || !pointInRect(event.clientX, event.clientY, rect)) return;
+    drag = { startX: event.clientX, startY: event.clientY, root: root };
+    event.preventDefault();
+  }, true);
+
+  document.addEventListener("pointerup", function (event) {
+    if (!drag || captureMode !== "box") return;
+    const root = drag.root;
+    const slideRect = root.getBoundingClientRect();
+    const selection = {
+      left: Math.max(slideRect.left, Math.min(drag.startX, event.clientX)),
+      top: Math.max(slideRect.top, Math.min(drag.startY, event.clientY)),
+      right: Math.min(slideRect.right, Math.max(drag.startX, event.clientX)),
+      bottom: Math.min(slideRect.bottom, Math.max(drag.startY, event.clientY))
+    };
+    drag = null;
+    event.preventDefault();
+    const members = Array.from(root.querySelectorAll("[data-od-id]")).filter(function (element) { return intersects(element.getBoundingClientRect(), selection); });
+    if (!members.length) {
+      if (port) port.postMessage({ protocol: config.protocol, version: config.version, type: CAPTURE_ERROR, source: "preview", transport: "MessagePort", nonce: config.nonce, code: "BRIDGE_CAPTURE_EMPTY", message: "Box did not contain a Stable Element ID." });
+      return;
+    }
+    const geometry = normalizedRect({ left: selection.left, top: selection.top, width: selection.right - selection.left, height: selection.bottom - selection.top }, slideRect);
+    const contexts = members.map(function (element) { return contextFor(element, slideRect); });
+    sendCapture(CAPTURE_BOX, geometry, members.map(function (element) { return element.getAttribute("data-od-id"); }), { members: contexts, ancestors: contexts[0].ancestors });
+  }, true);
 
   window.addEventListener("message", function (event) {
     if (event.source !== window.parent || event.origin !== config.origin) return;
@@ -170,7 +310,7 @@ export function createBridgeScript(config) {
       fileIndexVersion: config.fileIndexVersion,
       previewSessionId: config.previewSessionId,
       iframeInstanceId: config.iframeInstanceId,
-      source: "preview"
+       source: "preview"
     }, config.origin);
   }
 
@@ -199,6 +339,8 @@ export function createRendererHtml(config) {
     slideId: config.slideId,
     expectedSlideIds: config.expectedSlideIds || [],
     entryUrl: config.entryUrl,
+    annotationApi: config.annotationApi || (config.origin + "/api/annotations"),
+    overlay: config.overlay || null,
     capture: Boolean(config.capture),
     origin: config.origin
   });
@@ -217,13 +359,23 @@ export function createRendererHtml(config) {
     #preview-status[data-state="error"] { color: #ffadad; }
     #slide-list { display: flex; gap: .35rem; margin-left: auto; }
     #slide-list button { border: 1px solid #587181; border-radius: 3px; padding: .25rem .5rem; color: inherit; background: transparent; cursor: pointer; }
+    #annotation-controls { display: flex; gap: .35rem; align-items: center; }
+    #annotation-controls button { border: 1px solid #587181; border-radius: 3px; padding: .25rem .5rem; color: inherit; background: transparent; cursor: pointer; }
+    #annotation-controls button[data-active="true"] { border-color: #a5e3cf; color: #a5e3cf; }
+    #annotation-list { position: fixed; z-index: 3; left: .75rem; bottom: .75rem; max-width: 22rem; max-height: 12rem; overflow: auto; color: #d6e3ea; background: rgba(30, 41, 51, .94); font: 12px/1.35 Segoe UI, sans-serif; }
+    .annotation-item { display: grid; grid-template-columns: 1fr auto; gap: .35rem; padding: .45rem .6rem; border-bottom: 1px solid #405462; }
+    .annotation-item img { width: 4rem; height: 2.25rem; object-fit: cover; border: 1px solid #587181; }
+    #capture-overlay { position: fixed; z-index: 4; inset: 0; width: 100%; height: 100%; pointer-events: none; }
     body[data-capture="true"] #preview-status { display: none; }
+    body[data-capture="true"] #annotation-list { display: none; }
     body[data-capture="true"] #preview-frame { inset: 0; width: 100%; height: 100%; }
   </style>
 </head>
 <body data-capture="${config.capture ? "true" : "false"}">
-  <div id="preview-status" data-state="loading"><span id="preview-state">loading</span><span id="slide-list"></span></div>
+  <div id="preview-status" data-state="loading"><span id="preview-state">loading</span><span id="annotation-controls"><button id="annotation-click" type="button">click</button><button id="annotation-box" type="button">box</button><span id="annotation-state">capture unavailable</span></span><span id="slide-list"></span></div>
+  <div id="annotation-list" aria-live="polite"></div>
   <iframe id="preview-frame" title="SHppt Slide preview" src="${config.entryUrl}"></iframe>
+  ${config.overlay ? `<svg id="capture-overlay" viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true"><rect x="${Number(config.overlay.geometry?.x || 0)}" y="${Number(config.overlay.geometry?.y || 0)}" width="${Number(config.overlay.geometry?.width || 0)}" height="${Number(config.overlay.geometry?.height || 0)}" fill="rgba(255,214,92,.16)" stroke="#ffb703" stroke-width=".006"/><g>${(config.overlay.memberRects || []).map((rect) => `<rect x="${Number(rect.x || 0)}" y="${Number(rect.y || 0)}" width="${Number(rect.width || 0)}" height="${Number(rect.height || 0)}" fill="none" stroke="#fb8500" stroke-width=".003"/>`).join("")}</g></svg>` : ""}
   <script>
   (function () {
     "use strict";
@@ -234,11 +386,18 @@ export function createRendererHtml(config) {
     const OBSERVATION = "od:bridge:observation";
     const REQUEST = "od:bridge:request-observation";
     const ACTIVATE = "od:bridge:activate-slide";
+    const SET_CAPTURE_MODE = "od:bridge:set-capture-mode";
+    const CAPTURE_CLICK = "od:bridge:capture-click";
+    const CAPTURE_BOX = "od:bridge:capture-box";
+    const CAPTURE_ACK = "od:bridge:capture-ack";
+    const CAPTURE_ERROR = "od:bridge:capture-error";
     const frame = document.getElementById("preview-frame");
     const status = document.getElementById("preview-status");
     const statusText = document.getElementById("preview-state");
     const slideList = document.getElementById("slide-list");
-    const state = { status: "loading", handshake: "pending", error: null, observation: null, transport: null, sequence: 0 };
+    const annotationState = document.getElementById("annotation-state");
+    const annotationList = document.getElementById("annotation-list");
+    const state = { status: "loading", handshake: "pending", error: null, observation: null, transport: null, sequence: 0, port: null, captureIds: {}, annotations: [] };
     window.__shpptRendererState = state;
 
     function setState(next, error) {
@@ -253,7 +412,7 @@ export function createRendererHtml(config) {
     }
 
     function validObservation(observation) {
-      if (!observation || observation.protocol !== config.protocol || observation.version !== config.version || observation.type !== OBSERVATION || !Number.isInteger(observation.sequence) || observation.sequence < 1 || observation.nonce !== config.bridgeNonce || observation.projectId !== config.projectId || observation.fileIndexVersion !== config.fileIndexVersion || observation.previewSessionId !== config.previewSessionId || observation.iframeInstanceId !== config.iframeInstanceId) return { code: "BRIDGE_OBSERVATION_INVALID", message: "Bridge observation identity did not match the active preview." };
+      if (!observation || observation.protocol !== config.protocol || observation.version !== config.version || observation.type !== OBSERVATION || observation.source !== "preview" || observation.transport !== "MessagePort" || !Number.isInteger(observation.sequence) || observation.sequence < 1 || observation.nonce !== config.bridgeNonce || observation.projectId !== config.projectId || observation.fileIndexVersion !== config.fileIndexVersion || observation.previewSessionId !== config.previewSessionId || observation.iframeInstanceId !== config.iframeInstanceId) return { code: "BRIDGE_OBSERVATION_INVALID", message: "Bridge observation identity did not match the active preview." };
       if (!Array.isArray(observation.slides) || observation.slides.length === 0 || !validRect(observation.activeSlideRect)) return { code: "DECK_SLIDE_INVALID", message: "Bridge observation did not contain a non-empty Slide." };
       const observedSlideIds = observation.slides.map(function (slide) { return slide.slideId; });
       const expectedSlideIds = Array.isArray(config.expectedSlideIds) ? config.expectedSlideIds : [];
@@ -263,6 +422,92 @@ export function createRendererHtml(config) {
       if (!observation.activeSlideId || !observation.slides.some(function (slide) { return slide.slideId === observation.activeSlideId; })) return { code: "BRIDGE_OBSERVATION_INVALID", message: "Active Slide was not present in the observation." };
       if (!Array.isArray(observation.elements) || observation.elements.length > 256) return { code: "BRIDGE_OBSERVATION_INVALID", message: "Bridge element observation exceeded the supported bound." };
       return null;
+    }
+
+    function validCapture(message) {
+      if (!message || (message.type !== CAPTURE_CLICK && message.type !== CAPTURE_BOX) || message.protocol !== config.protocol || message.version !== config.version || message.source !== "preview" || message.transport !== "MessagePort" || message.origin !== config.origin || message.nonce !== config.bridgeNonce || message.projectId !== config.projectId || message.fileIndexVersion !== config.fileIndexVersion || message.previewSessionId !== config.previewSessionId || message.iframeInstanceId !== config.iframeInstanceId || message.slideId !== state.observation?.activeSlideId || !Number.isInteger(message.sequence) || message.sequence < 1 || typeof message.messageId !== "string") return { code: "BRIDGE_CAPTURE_INVALID", message: "Bridge capture identity did not match the active preview." };
+      if (state.captureIds[message.messageId]) return { duplicate: true };
+      if (message.sequence <= state.sequence) return { code: "BRIDGE_SEQUENCE_OUT_OF_ORDER", message: "Bridge capture sequence was duplicated or out of order." };
+      if (message.type === CAPTURE_CLICK && typeof message.stableElementId !== "string") return { code: "DECK_ELEMENT_ID_INVALID", message: "Click capture did not identify a Stable Element ID." };
+      if (message.type === CAPTURE_BOX && (!Array.isArray(message.stableElementIds) || message.stableElementIds.length === 0)) return { code: "DECK_ELEMENT_ID_INVALID", message: "Box capture did not identify Stable Element IDs." };
+      return null;
+    }
+
+    function sendCaptureAck(message, result) {
+      if (!state.port) return;
+      state.port.postMessage({ protocol: config.protocol, version: config.version, type: CAPTURE_ACK, source: "host", transport: "MessagePort", nonce: config.bridgeNonce, projectId: config.projectId, fileIndexVersion: config.fileIndexVersion, previewSessionId: config.previewSessionId, iframeInstanceId: config.iframeInstanceId, messageId: message?.messageId || null, sequence: message?.sequence || null, status: result.status, annotationId: result.annotationId || null, error: result.error || null });
+    }
+
+    function renderAnnotations() {
+      annotationList.textContent = "";
+      state.annotations.slice(0, 16).forEach(function (annotation) {
+        const item = document.createElement("div");
+        item.className = "annotation-item";
+        const text = document.createElement("span");
+        const target = annotation.type === "click" ? annotation.target.stableElementId : annotation.target.stableElementIds.join(", ");
+        text.textContent = annotation.type + " / " + target + " / " + annotation.workflowState;
+        item.appendChild(text);
+        const assetId = annotation.evidence?.screenshot?.assetId;
+        if (assetId) {
+          const image = document.createElement("img");
+          image.alt = "Annotation evidence";
+          image.src = "/api/evidence/" + encodeURIComponent(assetId);
+          item.appendChild(image);
+        }
+        annotationList.appendChild(item);
+      });
+    }
+
+    async function loadAnnotations() {
+      try {
+        const response = await fetch(config.annotationApi + "?projectId=" + encodeURIComponent(config.projectId) + "&fileIndexVersion=" + encodeURIComponent(config.fileIndexVersion));
+        if (!response.ok) return;
+        const body = await response.json();
+        state.annotations = Array.isArray(body.annotations) ? body.annotations : [];
+        renderAnnotations();
+      } catch {}
+    }
+
+    async function acceptCapture(message) {
+      const validation = validCapture(message);
+      if (validation?.duplicate) {
+        sendCaptureAck(message, state.captureIds[message.messageId]);
+        return;
+      }
+      if (validation) {
+        sendCaptureAck(message, { status: "rejected", error: validation });
+        setState("error", validation);
+        return;
+      }
+      state.sequence = message.sequence;
+      state.captureIds[message.messageId] = { status: "pending", annotationId: null };
+      annotationState.textContent = "saving";
+      try {
+        const response = await fetch(config.annotationApi, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: config.projectId, fileIndexVersion: config.fileIndexVersion, capture: message }) });
+        const body = await response.json();
+        const result = body.ack || { status: "rejected", error: body.error || { code: "ANNOTATION_SAVE_FAILED", message: "Annotation could not be saved." } };
+        state.captureIds[message.messageId] = result;
+        sendCaptureAck(message, result);
+        annotationState.textContent = result.status === "accepted" || result.status === "duplicate" ? "saved" : "rejected";
+        if (result.status === "accepted") await loadAnnotations();
+        if (result.status === "rejected") setState("error", result.error);
+      } catch {
+        const result = { status: "rejected", error: { code: "ANNOTATION_SAVE_FAILED", message: "Annotation could not be saved." } };
+        state.captureIds[message.messageId] = result;
+        sendCaptureAck(message, result);
+        setState("error", result.error);
+      }
+    }
+
+    function setCaptureMode(mode) {
+      if (!state.port || state.handshake !== "accepted") {
+        annotationState.textContent = "bridge unavailable";
+        return;
+      }
+      state.port.postMessage({ protocol: config.protocol, version: config.version, type: SET_CAPTURE_MODE, source: "host", transport: "MessagePort", nonce: config.bridgeNonce, mode: mode });
+      document.getElementById("annotation-click").dataset.active = mode === "click" ? "true" : "false";
+      document.getElementById("annotation-box").dataset.active = mode === "box" ? "true" : "false";
+      annotationState.textContent = mode + " armed";
     }
 
     function renderSlides() {
@@ -275,7 +520,7 @@ export function createRendererHtml(config) {
         button.setAttribute("aria-pressed", slide.slideId === state.observation.activeSlideId ? "true" : "false");
         button.textContent = slide.label;
         button.addEventListener("click", function () {
-          if (state.port) state.port.postMessage({ protocol: config.protocol, version: config.version, type: ACTIVATE, nonce: config.bridgeNonce, slideId: slide.slideId });
+          if (state.port) state.port.postMessage({ protocol: config.protocol, version: config.version, type: ACTIVATE, source: "host", transport: "MessagePort", nonce: config.bridgeNonce, slideId: slide.slideId });
         });
         slideList.appendChild(button);
       });
@@ -310,13 +555,20 @@ export function createRendererHtml(config) {
       state.port = channel.port1;
       channel.port1.addEventListener("message", function (portEvent) {
         const portMessage = portEvent.data || {};
+        if (portMessage.type === CAPTURE_ERROR) {
+          if (portMessage.protocol === config.protocol && portMessage.version === config.version && portMessage.nonce === config.bridgeNonce && portMessage.source === "preview") setState("error", portMessage);
+          return;
+        }
         if (portMessage.protocol !== config.protocol || portMessage.version !== config.version || portMessage.nonce !== config.bridgeNonce || portMessage.projectId !== config.projectId || portMessage.fileIndexVersion !== config.fileIndexVersion || portMessage.previewSessionId !== config.previewSessionId || portMessage.iframeInstanceId !== config.iframeInstanceId) return;
         if (portMessage.type === READY) {
           state.handshake = "accepted";
           state.transport = portMessage.transport;
-          state.port.postMessage({ protocol: config.protocol, version: config.version, type: REQUEST, nonce: config.bridgeNonce });
+          annotationState.textContent = "ready";
+          state.port.postMessage({ protocol: config.protocol, version: config.version, type: REQUEST, source: "host", transport: "MessagePort", nonce: config.bridgeNonce });
         } else if (portMessage.type === OBSERVATION) {
           acceptObservation(portMessage);
+        } else if (portMessage.type === CAPTURE_CLICK || portMessage.type === CAPTURE_BOX) {
+          acceptCapture(portMessage);
         }
       });
       channel.port1.start();
@@ -325,9 +577,12 @@ export function createRendererHtml(config) {
 
     window.__shpptSetCaptureMode = function (enabled) { document.body.dataset.capture = enabled ? "true" : "false"; };
     window.__shpptSelectSlide = function (slideId) {
-      if (state.port) state.port.postMessage({ protocol: config.protocol, version: config.version, type: ACTIVATE, nonce: config.bridgeNonce, slideId: slideId });
+      if (state.port) state.port.postMessage({ protocol: config.protocol, version: config.version, type: ACTIVATE, source: "host", transport: "MessagePort", nonce: config.bridgeNonce, slideId: slideId });
     };
     window.__shpptBridgeReady = function () { return state.status === "ready" && state.handshake === "accepted"; };
+    document.getElementById("annotation-click").addEventListener("click", function () { setCaptureMode("click"); });
+    document.getElementById("annotation-box").addEventListener("click", function () { setCaptureMode("box"); });
+    loadAnnotations();
   })();
   </script>
 </body>
