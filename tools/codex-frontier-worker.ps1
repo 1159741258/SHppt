@@ -126,9 +126,7 @@ function Get-IssueCandidates {
     if ($script:RequestedIssueNumber -gt 0) {
         return @(
             Invoke-GhJson -Arguments @(
-                "issue", "view", "$script:RequestedIssueNumber",
-                "--repo", $script:Repo,
-                "--json", "number,title,state,labels,assignees,createdAt,url"
+                "api", "repos/$($script:Repo)/issues/$($script:RequestedIssueNumber)"
             ) -Name "issue #$script:RequestedIssueNumber"
         )
     }
@@ -148,26 +146,32 @@ function Get-IssueCandidates {
 function Get-IssueDetails {
     param([int]$Number)
 
-    $issue = Invoke-GhJson -Arguments @(
-        "issue", "view", "$Number",
-        "--repo", $script:Repo,
-        "--json", "number,title,body,state,labels,assignees,comments,url"
-    ) -Name "issue #$Number"
     $apiIssue = Invoke-GhJson -Arguments @(
         "api", "repos/$($script:Repo)/issues/$Number"
     ) -Name "issue API #$Number"
+    $commentsText = Invoke-GhText -Arguments @(
+        "api", "repos/$($script:Repo)/issues/$Number/comments",
+        "--paginate", "--slurp"
+    )
+    $commentPages = ConvertFrom-Json -InputObject $commentsText -Depth 100
+    $comments = @(
+        foreach ($page in @($commentPages)) {
+            foreach ($comment in @($page)) {
+                $comment.body
+            }
+        }
+    )
 
     $dependencySummary = $apiIssue.issue_dependencies_summary
-    $comments = @($issue.comments | ForEach-Object { $_.body })
 
     return [ordered]@{
-        number = $issue.number
-        title = $issue.title
-        body = $issue.body
-        state = $issue.state
-        url = $issue.url
-        labels = @(Get-LabelNames -Issue $issue)
-        assignees = @(Get-LoginNames -Issue $issue)
+        number = $apiIssue.number
+        title = $apiIssue.title
+        body = $apiIssue.body
+        state = $apiIssue.state
+        url = $apiIssue.html_url
+        labels = @($apiIssue.labels | ForEach-Object { $_.name })
+        assignees = @($apiIssue.assignees | ForEach-Object { $_.login })
         comments = $comments
         issue_dependencies_summary = $dependencySummary
     }
@@ -339,9 +343,7 @@ function Cleanup-ClosedCodexPullRequests {
 
         foreach ($number in @(Get-IssueNumbersFromPullRequest -PullRequest $pullRequest)) {
             $issue = Invoke-GhJson -Arguments @(
-                "issue", "view", "$number",
-                "--repo", $script:Repo,
-                "--json", "state,labels"
+                "api", "repos/$($script:Repo)/issues/$number"
             ) -Name "closed pull request issue #$number"
             if ($null -eq $issue) {
                 continue
