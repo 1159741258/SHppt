@@ -13,7 +13,7 @@ export function isRuntimeError(error) {
 
 export function redactText(value) {
   return String(value ?? "")
-    .replace(/[A-Za-z]:\\[^\r\n"']+/g, "[redacted-path]")
+    .replace(/[A-Za-z]:[\\/][^\r\n"']+/g, "[redacted-path]")
     .replace(/\\\\[^\r\n"']+/g, "[redacted-path]")
     .replace(/(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]");
 }
@@ -34,13 +34,21 @@ export function publicError(error) {
 }
 
 function redactDetails(details) {
-  if (!details || typeof details !== "object") return {};
+  const output = redactValue(details, "", 0, new WeakSet());
+  return output && typeof output === "object" && !Array.isArray(output) ? output : {};
+}
+
+function redactValue(value, key, depth, seen) {
+  if (/contentRoot|absolutePath|prompt|credential|token|secret|password|authorization|cookie/i.test(key)) return undefined;
+  if (typeof value === "string") return redactText(value);
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= 4 || seen.has(value)) return "[redacted]";
+  seen.add(value);
+  if (Array.isArray(value)) return value.slice(0, 32).map((item) => redactValue(item, "", depth + 1, seen));
   const output = {};
-  for (const [key, value] of Object.entries(details)) {
-    if (/contentRoot|absolutePath|prompt|credential|token|secret|password/i.test(key)) continue;
-    if (typeof value === "string") output[key] = redactText(value);
-    else if (Array.isArray(value)) output[key] = value.slice(0, 32).map((item) => typeof item === "string" ? redactText(item) : item);
-    else output[key] = value;
+  for (const [childKey, childValue] of Object.entries(value)) {
+    const redacted = redactValue(childValue, childKey, depth + 1, seen);
+    if (redacted !== undefined) output[childKey] = redacted;
   }
   return output;
 }

@@ -15,6 +15,8 @@ export function createBridgeScript(config) {
     previewSessionId: config.previewSessionId,
     iframeInstanceId: config.iframeInstanceId,
     slideId: config.slideId,
+    expectedSlideIds: config.expectedSlideIds || [],
+    fontFamily: config.fontFamily || null,
     origin: config.origin
   });
   return `<script data-shppt-bridge="v1">
@@ -46,7 +48,11 @@ export function createBridgeScript(config) {
   }
 
   function captureSlideFacts() {
-    slideFacts = slideRoots().map(function (element, index) {
+    const roots = slideRoots();
+    const initial = roots.find(function (element) { return element.getAttribute("data-od-slide") === activeSlideId; }) || roots[0] || null;
+    if (initial) activeSlideId = initial.getAttribute("data-od-slide");
+    slideFacts = roots.map(function (element, index) {
+      setActiveElement(element, roots);
       const rect = rectOf(element);
       return {
         slideId: element.getAttribute("data-od-slide"),
@@ -55,6 +61,16 @@ export function createBridgeScript(config) {
         rect: rect
       };
     });
+    if (initial) setActiveElement(initial, roots);
+  }
+
+  function setActiveElement(selected, roots) {
+    roots.forEach(function (element) {
+      const isActive = element === selected;
+      element.hidden = !isActive;
+      element.setAttribute("aria-hidden", isActive ? "false" : "true");
+      element.style.display = isActive ? "" : "none";
+    });
   }
 
   function activate(slideId) {
@@ -62,12 +78,7 @@ export function createBridgeScript(config) {
     const selected = roots.find(function (element) { return element.getAttribute("data-od-slide") === slideId; });
     if (!selected) return false;
     activeSlideId = slideId;
-    roots.forEach(function (element) {
-      const isActive = element === selected;
-      element.hidden = !isActive;
-      element.setAttribute("aria-hidden", isActive ? "false" : "true");
-      element.style.display = isActive ? "" : "none";
-    });
+    setActiveElement(selected, roots);
     return true;
   }
 
@@ -108,7 +119,7 @@ export function createBridgeScript(config) {
         return { family: font.family, status: font.status, weight: font.weight, style: font.style };
       }),
       fontReady: !document.fonts || document.fonts.status === "loaded",
-      fontCheck: !document.fonts || document.fonts.check("16px \\\"Fixture Sans\\\""),
+      fontCheck: !config.fontFamily || !document.fonts || document.fonts.check("16px " + JSON.stringify(config.fontFamily)),
       images: Array.from(document.images || []).map(function (image) {
         return { src: image.currentSrc ? "local" : "missing", complete: image.complete, width: image.naturalWidth, height: image.naturalHeight };
       }),
@@ -149,7 +160,6 @@ export function createBridgeScript(config) {
 
   function start() {
     captureSlideFacts();
-    if (!activeSlideId && slideFacts[0]) activeSlideId = slideFacts[0].slideId;
     activate(activeSlideId);
     window.parent.postMessage({
       protocol: config.protocol,
@@ -187,6 +197,7 @@ export function createRendererHtml(config) {
     scopeId: config.scopeId,
     bridgeNonce: config.bridgeNonce,
     slideId: config.slideId,
+    expectedSlideIds: config.expectedSlideIds || [],
     entryUrl: config.entryUrl,
     capture: Boolean(config.capture),
     origin: config.origin
@@ -244,7 +255,10 @@ export function createRendererHtml(config) {
     function validObservation(observation) {
       if (!observation || observation.protocol !== config.protocol || observation.version !== config.version || observation.type !== OBSERVATION || !Number.isInteger(observation.sequence) || observation.sequence < 1 || observation.nonce !== config.bridgeNonce || observation.projectId !== config.projectId || observation.fileIndexVersion !== config.fileIndexVersion || observation.previewSessionId !== config.previewSessionId || observation.iframeInstanceId !== config.iframeInstanceId) return { code: "BRIDGE_OBSERVATION_INVALID", message: "Bridge observation identity did not match the active preview." };
       if (!Array.isArray(observation.slides) || observation.slides.length === 0 || !validRect(observation.activeSlideRect)) return { code: "DECK_SLIDE_INVALID", message: "Bridge observation did not contain a non-empty Slide." };
-      const ratios = observation.slides.map(function (slide) { return slide.rect && slide.rect.width > 0 && slide.rect.height > 0 ? slide.rect.width / slide.rect.height : 0; });
+      const observedSlideIds = observation.slides.map(function (slide) { return slide.slideId; });
+      const expectedSlideIds = Array.isArray(config.expectedSlideIds) ? config.expectedSlideIds : [];
+      if (expectedSlideIds.length && (observedSlideIds.length !== expectedSlideIds.length || expectedSlideIds.some(function (slideId) { return !observedSlideIds.includes(slideId); }) || new Set(observedSlideIds).size !== observedSlideIds.length)) return { code: "DECK_SLIDE_INVALID", message: "Bridge observation did not match the indexed Slide IDs." };
+      const ratios = observation.slides.map(function (slide) { return validRect(slide.rect) ? slide.rect.width / slide.rect.height : 0; });
       if (ratios.some(function (ratio) { return ratio <= 0; }) || ratios.some(function (ratio) { return Math.abs(ratio - ratios[0]) > 0.01; })) return { code: "DECK_SLIDE_SIZE_MISMATCH", message: "Slide aspect ratios do not match.", details: { ratios: ratios, rects: observation.slides.map(function (slide) { return slide.rect; }) } };
       if (!observation.activeSlideId || !observation.slides.some(function (slide) { return slide.slideId === observation.activeSlideId; })) return { code: "BRIDGE_OBSERVATION_INVALID", message: "Active Slide was not present in the observation." };
       if (!Array.isArray(observation.elements) || observation.elements.length > 256) return { code: "BRIDGE_OBSERVATION_INVALID", message: "Bridge element observation exceeded the supported bound." };
@@ -257,6 +271,8 @@ export function createRendererHtml(config) {
       state.observation.slides.forEach(function (slide) {
         const button = document.createElement("button");
         button.type = "button";
+        button.dataset.slideId = slide.slideId;
+        button.setAttribute("aria-pressed", slide.slideId === state.observation.activeSlideId ? "true" : "false");
         button.textContent = slide.label;
         button.addEventListener("click", function () {
           if (state.port) state.port.postMessage({ protocol: config.protocol, version: config.version, type: ACTIVATE, nonce: config.bridgeNonce, slideId: slide.slideId });

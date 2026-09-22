@@ -10,6 +10,8 @@ const TOKEN_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/;
 const PROJECT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HTML_EXTENSIONS = new Set([".html", ".htm"]);
 const VOID_ELEMENTS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+const FORBIDDEN_HTML_CONTEXTS = new Set(["script", "style", "template"]);
+const NON_HTML_SLIDE_ROOTS = new Set(["svg", "math"]);
 
 export function createProjectId() {
   return randomUUID();
@@ -29,7 +31,10 @@ export async function canonicalizeContentRoot(input) {
   } catch {
     throw new RuntimeError("PROJECT_ROOT_INVALID", "Content Root does not exist or cannot be read.");
   }
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+  if (isReparsePoint(stat)) {
+    throw new RuntimeError("PROJECT_PATH_ESCAPE", "Content Root cannot be a reparse point.");
+  }
+  if (!stat.isDirectory()) {
     throw new RuntimeError("PROJECT_ROOT_INVALID", "Content Root must be an ordinary local directory.");
   }
   let realPath;
@@ -41,10 +46,14 @@ export async function canonicalizeContentRoot(input) {
   if (realPath.startsWith("\\\\") || realPath.startsWith("//")) {
     throw new RuntimeError("PROJECT_ROOT_INVALID", "UNC and network Content Roots are not supported.");
   }
+  if (!samePath(candidate, realPath)) {
+    throw new RuntimeError("PROJECT_PATH_ESCAPE", "Content Root cannot be a reparse point.");
+  }
   return realPath;
 }
 
 export async function loadOrCreateProjectId(stateDirectory, contentRoot) {
+  const canonicalRoot = await canonicalizeContentRoot(contentRoot);
   const statePath = path.join(stateDirectory, "projects.json");
   await fs.mkdir(stateDirectory, { recursive: true });
   let state = { projects: {} };
@@ -58,11 +67,11 @@ export async function loadOrCreateProjectId(stateDirectory, contentRoot) {
       throw new RuntimeError("PROJECT_STATE_INVALID", "Trusted Project state cannot be read.");
     }
   }
-  const key = contentRoot.toLowerCase();
+  const key = canonicalRoot.toLowerCase();
   let projectId = state.projects[key]?.projectId;
   if (!PROJECT_ID_PATTERN.test(projectId ?? "")) projectId = createProjectId();
-  state.projects[key] = { projectId, contentRoot };
-  const temporaryPath = `${statePath}.${process.pid}.tmp`;
+  state.projects[key] = { projectId, contentRoot: canonicalRoot };
+  const temporaryPath = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
   await fs.writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
   await fs.rename(temporaryPath, statePath);
   return projectId;
@@ -78,15 +87,16 @@ export async function scanProject({ contentRoot, projectId }) {
   if (manifestPath) {
     await ordinaryFileStat(manifestPath, "PROJECT_MANIFEST_INVALID");
     const manifest = await readJsonFile(manifestPath, "PROJECT_MANIFEST_INVALID");
-    const keys = Object.keys(manifest);
-    if (keys.some((key) => !["schemaVersion", "entry"].includes(key)) || manifest.schemaVersion !== 1 || typeof manifest.entry !== "string" || manifest.entry.trim() === "") {
+    const keys = manifest && typeof manifest === "object" && !Array.isArray(manifest) ? Object.keys(manifest) : [];
+    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) || keys.some((key) => !["schemaVersion", "entry"].includes(key)) || manifest.schemaVersion !== 1 || typeof manifest.entry !== "string" || manifest.entry.trim() === "") {
       throw new RuntimeError("PROJECT_MANIFEST_INVALID", "shppt.json must contain only schemaVersion 1 and a non-empty entry.");
     }
-    entryPath = validateProjectRelativePath(manifest.entry, "PROJECT_PATH_ESCAPE");
-    if (!HTML_EXTENSIONS.has(path.posix.extname(entryPath).toLowerCase())) {
+    const requestedEntryPath = validateProjectRelativePath(manifest.entry, "PROJECT_PATH_ESCAPE");
+    if (!HTML_EXTENSIONS.has(path.posix.extname(requestedEntryPath).toLowerCase())) {
       throw new RuntimeError("PROJECT_MANIFEST_INVALID", "Manifest entry must be an HTML document.");
     }
     manifestEntry = toProjectPath(root, manifestPath);
+    entryPath = requestedEntryPath;
   } else {
     const fallback = await findCaseInsensitiveFile(root, "index.html");
     if (!fallback) throw new RuntimeError("PROJECT_ENTRY_NOT_FOUND", "No manifest or root index.html was found.");
@@ -94,6 +104,7 @@ export async function scanProject({ contentRoot, projectId }) {
   }
 
   const entryAbsolute = await resolveProjectFile(root, entryPath, "PROJECT_ENTRY_NOT_FOUND");
+  entryPath = toProjectPath(root, entryAbsolute);
   const entryStat = await ordinaryFileStat(entryAbsolute, "PROJECT_ENTRY_INVALID");
   if (!HTML_EXTENSIONS.has(path.extname(entryAbsolute).toLowerCase())) {
     throw new RuntimeError("PROJECT_ENTRY_INVALID", "Entry Document must be an HTML file.");
@@ -136,11 +147,12 @@ export async function scanProject({ contentRoot, projectId }) {
     throw new RuntimeError("DECK_NO_SLIDES", "Entry Document does not contain a Slide.");
   }
 
-  const sortedFiles = [...files.values()].sort((left, right) => left.path.localeCompare(right.path, "en", { sensitivity: "base" }));
+  const sortedFiles = [...files.values()].sort(compareFileIndexEntries);
   const versionInput = sortedFiles.map((file) => `${file.path.toLowerCase()}\0${file.contentHash ?? ""}`).join("\n");
   const fileIndexVersion = `sha256:${sha256(versionInput)}`;
   const snapshot = {
     projectId,
+    name: path.basename(root),
     type: PROJECT_TYPE,
     entryPath,
     contractVersion: CONTRACT_VERSION,
@@ -152,7 +164,7 @@ export async function scanProject({ contentRoot, projectId }) {
     contentRoot: root,
     entryStat
   };
-  return snapshot;
+  return freezeSnapshot(snapshot);
 }
 
 export function publicSnapshot(snapshot) {
@@ -177,7 +189,7 @@ export async function readSnapshotFile(snapshot, projectPath) {
 }
 
 export function validateProjectRelativePath(value, errorCode = "PROJECT_PATH_ESCAPE") {
-  if (typeof value !== "string" || value.length === 0 || value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:/.test(value) || value.includes("\0")) {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:/.test(value) || value.includes("\0") || value.includes(":")) {
     throw new RuntimeError(errorCode, "Path is not a valid Project-relative Path.");
   }
   const parts = value.split("/");
@@ -194,19 +206,22 @@ async function registerResource(files, root, resource) {
   const normalized = validateResourceReference(resource.raw, resource.fromPath);
   if (normalized === null) return null;
   const absolutePath = await resolveProjectFile(root, normalized, "PROJECT_RESOURCE_INVALID");
+  const actualPath = toProjectPath(root, absolutePath);
   const stat = await ordinaryFileStat(absolutePath, "PROJECT_RESOURCE_INVALID");
-  await addIndexedFile(files, root, normalized, kindForPath(normalized), false, false, stat);
-  return normalized;
+  await addIndexedFile(files, root, actualPath, kindForPath(actualPath), false, false, stat);
+  return actualPath;
 }
 
 async function addIndexedFile(files, root, projectPath, kind, entryCandidate, previewable, knownStat = null) {
   const normalized = validateProjectRelativePath(projectPath, "PROJECT_PATH_ESCAPE");
   if (files.has(normalized.toLowerCase())) return;
   const absolutePath = await resolveProjectFile(root, normalized, "PROJECT_PATH_ESCAPE");
+  const actualPath = toProjectPath(root, absolutePath);
+  if (files.has(actualPath.toLowerCase())) return;
   const stat = knownStat ?? await ordinaryFileStat(absolutePath, "PROJECT_RESOURCE_INVALID");
   const bytes = await fs.readFile(absolutePath);
-  files.set(normalized.toLowerCase(), {
-    path: normalized,
+  files.set(actualPath.toLowerCase(), {
+    path: actualPath,
     kind,
     size: stat.size,
     mtime: stat.mtime.toISOString(),
@@ -221,9 +236,10 @@ async function ordinaryFileStat(absolutePath, errorCode) {
   let stat;
   try {
     const link = await fs.lstat(absolutePath);
-    if (link.isSymbolicLink()) throw new Error("reparse");
+    if (isReparsePoint(link)) throw new RuntimeError("PROJECT_PATH_ESCAPE", "Reparse points are not Project Resources.");
     stat = await fs.stat(absolutePath);
-  } catch {
+  } catch (error) {
+    if (error instanceof RuntimeError) throw error;
     throw new RuntimeError(errorCode, "A Project file is missing, inaccessible, or not an ordinary file.");
   }
   if (!stat.isFile()) throw new RuntimeError(errorCode, "A Project Resource is not an ordinary file.");
@@ -243,13 +259,22 @@ async function resolveProjectFile(root, projectPath, errorCode) {
     current = path.join(current, segment);
     try {
       const link = await fs.lstat(current);
-      if (link.isSymbolicLink()) throw new RuntimeError("PROJECT_PATH_ESCAPE", "Reparse points are not Project Resources.");
+      if (isReparsePoint(link)) throw new RuntimeError("PROJECT_PATH_ESCAPE", "Reparse points are not Project Resources.");
+      const realSegment = await fs.realpath(current);
+      if (!samePath(current, realSegment)) throw new RuntimeError("PROJECT_PATH_ESCAPE", "Reparse points are not Project Resources.");
     } catch (error) {
       if (error instanceof RuntimeError) throw error;
       throw new RuntimeError(errorCode, "A Project path cannot be resolved.");
     }
   }
-  return absolutePath;
+  try {
+    const realPath = await fs.realpath(absolutePath);
+    if (!samePath(absolutePath, realPath)) throw new RuntimeError("PROJECT_PATH_ESCAPE", "Reparse points are not Project Resources.");
+    return realPath;
+  } catch (error) {
+    if (error instanceof RuntimeError) throw error;
+    throw new RuntimeError(errorCode, "A Project path cannot be resolved.");
+  }
 }
 
 async function findCaseInsensitiveFile(root, filename) {
@@ -272,11 +297,13 @@ async function readJsonFile(filePath, errorCode) {
 }
 
 function parseEntryDocument(text, entryPath) {
-  if (!/^\s*<!doctype\s+html\b/i.test(text) || !/<meta\b[^>]*charset\s*=\s*["']?utf-8\b/i.test(text)) {
+  const hasUtf8Declaration = /<meta\b[^>]*\bcharset\s*=\s*["']?utf-8\b/i.test(text) || /<meta\b[^>]*\bhttp-equiv\s*=\s*["']?content-type["']?[^>]*\bcontent\s*=\s*["'][^"']*charset\s*=\s*utf-8\b/i.test(text) || /<meta\b[^>]*\bcontent\s*=\s*["'][^"']*charset\s*=\s*utf-8\b[^>]*\bhttp-equiv\s*=\s*["']?content-type["']?/i.test(text);
+  if (!/^\s*<!doctype\s+html\b/i.test(text) || !hasUtf8Declaration) {
     throw new RuntimeError("PROJECT_ENTRY_INVALID", "Entry Document must declare HTML document mode and UTF-8.");
   }
   const bodyStart = text.search(/<body\b[^>]*>/i);
-  const bodyEnd = text.search(/<\/body\s*>/i);
+  const bodyClose = text.search(/<\/body\s*>/i);
+  const bodyEnd = bodyClose < 0 ? text.length : bodyClose;
   if (bodyStart < 0 || bodyEnd < bodyStart) throw new RuntimeError("PROJECT_ENTRY_INVALID", "Entry Document must contain a body.");
 
   const slides = [];
@@ -284,9 +311,10 @@ function parseEntryDocument(text, entryPath) {
   const slideIds = new Set();
   const elementIds = new Set();
   const stack = [];
+  const structuralText = maskRawTextBodies(text);
   const tagPattern = /<!--[^]*?-->|<\/?[A-Za-z][^>]*>/g;
   let match;
-  while ((match = tagPattern.exec(text))) {
+  while ((match = tagPattern.exec(structuralText))) {
     const raw = match[0];
     if (raw.startsWith("<!--") || /^<!/i.test(raw)) continue;
     const closing = /^<\//.test(raw);
@@ -300,10 +328,11 @@ function parseEntryDocument(text, entryPath) {
     }
     const attrs = parseAttributes(raw);
     const inBody = match.index > bodyStart && match.index < bodyEnd;
+    const inForbiddenContext = stack.some((item) => FORBIDDEN_HTML_CONTEXTS.has(item.tagName));
     const slideId = attrs.get("data-od-slide");
     const stableId = attrs.get("data-od-id");
     if (slideId !== undefined) {
-      if (!inBody || ["script", "style", "template"].includes(tagName) || !TOKEN_PATTERN.test(slideId) || slideIds.has(slideId)) {
+      if (attrs.duplicates.has("data-od-slide") || !inBody || inForbiddenContext || FORBIDDEN_HTML_CONTEXTS.has(tagName) || NON_HTML_SLIDE_ROOTS.has(tagName) || !TOKEN_PATTERN.test(slideId) || slideIds.has(slideId)) {
         throw new RuntimeError("DECK_SLIDE_INVALID", "Slide roots must have unique valid IDs inside body.");
       }
       if (stack.some((item) => item.slideId)) throw new RuntimeError("DECK_SLIDE_INVALID", "Slide roots cannot be nested.");
@@ -312,7 +341,7 @@ function parseEntryDocument(text, entryPath) {
     }
     const activeSlide = [...stack].reverse().find((item) => item.slideId)?.slideId ?? slideId;
     if (stableId !== undefined) {
-      if (!activeSlide || ["script", "style", "template"].includes(tagName) || !TOKEN_PATTERN.test(stableId) || elementIds.has(stableId)) {
+      if (attrs.duplicates.has("data-od-id") || !activeSlide || inForbiddenContext || FORBIDDEN_HTML_CONTEXTS.has(tagName) || !TOKEN_PATTERN.test(stableId) || elementIds.has(stableId)) {
         throw new RuntimeError("DECK_ELEMENT_ID_INVALID", "Stable Element IDs must be unique valid IDs inside a Slide.");
       }
       elementIds.add(stableId);
@@ -329,20 +358,29 @@ function parseEntryDocument(text, entryPath) {
 
 function parseAttributes(tag) {
   const attrs = new Map();
+  attrs.duplicates = new Set();
   const body = tag.replace(/^<\/?[A-Za-z][A-Za-z0-9:-]*/, "").replace(/\/?>$/, "");
   const pattern = /([A-Za-z_:][A-Za-z0-9:_.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
   let match;
-  while ((match = pattern.exec(body))) attrs.set(match[1].toLowerCase(), match[2] ?? match[3] ?? match[4] ?? "");
+  while ((match = pattern.exec(body))) {
+    const name = match[1].toLowerCase();
+    if (attrs.has(name)) attrs.duplicates.add(name);
+    attrs.set(name, match[2] ?? match[3] ?? match[4] ?? "");
+  }
   return attrs;
 }
 
 function collectHtmlResources(text, fromPath) {
   const resources = [];
+  const structuralText = maskRawTextBodies(text);
   const tagPattern = /<([A-Za-z][A-Za-z0-9:-]*)\b[^>]*>/g;
   let match;
-  while ((match = tagPattern.exec(text))) {
+  while ((match = tagPattern.exec(structuralText))) {
     const tagName = match[1].toLowerCase();
     const attrs = parseAttributes(match[0]);
+    if (tagName === "base" && attrs.has("href")) {
+      throw new RuntimeError("PROJECT_RESOURCE_INVALID", "Base URLs are not supported by the Project Resource contract.");
+    }
     for (const attr of ["src", "poster"]) if (attrs.has(attr)) resources.push({ raw: attrs.get(attr), fromPath });
     if (tagName === "link" && attrs.has("href")) resources.push({ raw: attrs.get("href"), fromPath });
     if (attrs.has("srcset")) {
@@ -350,32 +388,42 @@ function collectHtmlResources(text, fromPath) {
     }
     if (attrs.has("style")) resources.push(...collectCssResources(attrs.get("style"), fromPath));
   }
+  const scriptPattern = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
+  while ((match = scriptPattern.exec(text))) {
+    const attrs = parseAttributes(`<script${match[1]}>`);
+    if (!attrs.has("src")) resources.push(...collectScriptResources(match[2], fromPath));
+  }
+  const stylePattern = /<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi;
+  while ((match = stylePattern.exec(text))) resources.push(...collectCssResources(match[1], fromPath));
   return resources;
 }
 
 function collectCssResources(text, fromPath) {
   const resources = [];
+  const source = text.replace(/\/\*[\s\S]*?\*\//g, "");
   const pattern = /url\(\s*(["']?)(.*?)\1\s*\)/gi;
   let match;
-  while ((match = pattern.exec(text))) resources.push({ raw: match[2].trim(), fromPath });
+  while ((match = pattern.exec(source))) resources.push({ raw: match[2].trim(), fromPath });
   const importPattern = /@import\s+(["'])(.*?)\1/gi;
-  while ((match = importPattern.exec(text))) resources.push({ raw: match[2].trim(), fromPath });
+  while ((match = importPattern.exec(source))) resources.push({ raw: match[2].trim(), fromPath });
   return resources;
 }
 
 function collectScriptResources(text, fromPath) {
-  if (/\bfetch\s*\(|\bimport\s*\(|\bnavigator\.serviceWorker\b|\bURL\.createObjectURL\s*\(/.test(text)) {
+  const staticUrls = /\bnew\s+URL\(\s*(?:"([^"]+)"|'([^']+)')\s*,\s*import\.meta\.url\s*\)/gi;
+  const withoutStaticUrls = text.replace(staticUrls, "");
+  if (/\bfetch\s*\(|\bimport\s*\(|\b(?:navigator\.)?serviceWorker\b|\bURL\.createObjectURL\s*\(|\b(?:setAttribute|setProperty)\s*\(\s*["'](?:src|href|poster)["']|\.\s*(?:src|href|poster)\s*=|\bnew\s+(?:URL|XMLHttpRequest|WebSocket)\s*\(/i.test(withoutStaticUrls)) {
     throw new RuntimeError("PROJECT_RESOURCE_DYNAMIC_UNSUPPORTED", "Preview depends on a runtime-determined Resource URL.");
   }
   const resources = [];
   const patterns = [
     /\bimport\s+(?:[^"']+?\s+from\s+)?["']([^"']+)["']/g,
     /\bexport\s+[^"']*?\sfrom\s+["']([^"']+)["']/g,
-    /\bnew\s+URL\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*\)/g
+    staticUrls
   ];
   for (const pattern of patterns) {
     let match;
-    while ((match = pattern.exec(text))) resources.push({ raw: match[1], fromPath });
+    while ((match = pattern.exec(text))) resources.push({ raw: pattern === staticUrls ? (match[1] ?? match[2]) : match[1], fromPath });
   }
   return resources;
 }
@@ -383,9 +431,9 @@ function collectScriptResources(text, fromPath) {
 function validateResourceReference(raw, fromPath) {
   if (typeof raw !== "string" || raw.trim() === "") return null;
   const value = raw.trim();
-  if (value.startsWith("#") || value.startsWith("data:")) return null;
-  if (value.startsWith("blob:")) throw new RuntimeError("PROJECT_RESOURCE_DYNAMIC_UNSUPPORTED", "Blob Resources are not stable Project Resources.");
-  if (/^(?:https?|file|javascript|vbscript):/i.test(value) || value.startsWith("//")) {
+  if (value.startsWith("#") || /^data:/i.test(value)) return null;
+  if (/^blob:/i.test(value)) throw new RuntimeError("PROJECT_RESOURCE_DYNAMIC_UNSUPPORTED", "Blob Resources are not stable Project Resources.");
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/i.test(value) || value.startsWith("//")) {
     throw new RuntimeError("PROJECT_RESOURCE_INVALID", "Remote and executable Resource URLs are not supported.");
   }
   const withoutQuery = value.split("#", 1)[0].split("?", 1)[0];
@@ -397,6 +445,9 @@ function validateResourceReference(raw, fromPath) {
     throw new RuntimeError("PROJECT_RESOURCE_INVALID", "Resource path encoding is invalid.");
   }
   if (decoded.includes("\\") || decoded.includes("\0")) throw new RuntimeError("PROJECT_PATH_ESCAPE", "Resource path contains an invalid separator.");
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/i.test(decoded) || decoded.startsWith("//")) {
+    throw new RuntimeError("PROJECT_RESOURCE_INVALID", "Remote and executable Resource URLs are not supported.");
+  }
   const baseParts = fromPath.split("/");
   baseParts.pop();
   const inputParts = decoded.startsWith("/") ? decoded.slice(1).split("/") : [...baseParts, ...decoded.split("/")];
@@ -428,9 +479,46 @@ function kindForPath(projectPath) {
   if ([".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif"].includes(extension)) return "image";
   if ([".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg"].includes(extension)) return "media";
   if ([".woff", ".woff2", ".ttf", ".otf"].includes(extension)) return "font";
+  if (extension === ".json") return "data";
   return "other";
 }
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function isReparsePoint(stat) {
+  return Boolean(stat?.isSymbolicLink?.());
+}
+
+function samePath(left, right) {
+  const normalize = (value) => path.normalize(value).replace(/[\\/]+$/, "").toLowerCase();
+  return normalize(left) === normalize(right);
+}
+
+function compareFileIndexEntries(left, right) {
+  const leftPath = left.path.toLowerCase();
+  const rightPath = right.path.toLowerCase();
+  return leftPath < rightPath ? -1 : leftPath > rightPath ? 1 : left.path < right.path ? -1 : left.path > right.path ? 1 : 0;
+}
+
+function freezeSnapshot(snapshot) {
+  for (const slide of snapshot.slides) {
+    Object.freeze(slide.stableElementIds);
+    Object.freeze(slide);
+  }
+  for (const file of snapshot.files) Object.freeze(file);
+  Object.freeze(snapshot.entryStat);
+  Object.freeze(snapshot.slides);
+  Object.freeze(snapshot.files);
+  return Object.freeze(snapshot);
+}
+
+function maskRawTextBodies(text) {
+  return text.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, (whole, tagName) => {
+    const openEnd = whole.indexOf(">");
+    const closeStart = whole.toLowerCase().lastIndexOf(`</${tagName.toLowerCase()}`);
+    if (openEnd < 0 || closeStart <= openEnd) return whole;
+    return `${whole.slice(0, openEnd + 1)}${" ".repeat(closeStart - openEnd - 1)}${whole.slice(closeStart)}`;
+  });
 }
