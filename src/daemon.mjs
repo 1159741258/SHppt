@@ -8,8 +8,10 @@ import * as zlib from "node:zlib";
 import { canonicalizeContentRoot, getFile, loadOrCreateProjectId, publicSnapshot, readSnapshotFile, scanProject, validateProjectRelativePath } from "./project.mjs";
 import { createRendererHtml, injectBridge } from "./bridge.mjs";
 import { CdpRenderer } from "./cdp-renderer.mjs";
+import { ProjectEventLog } from "./event-stream.mjs";
 import { RuntimeError, publicError } from "./errors.mjs";
 import { ANNOTATION_SCHEMA_VERSION, createAnnotationV1, publicAnnotation, validateAnnotationV1, validateBridgeCapture } from "./annotation.mjs";
+import { StableProjectObserver, defaultWatcherRegistry } from "./watcher.mjs";
 
 const DEFAULT_BUILD_IDENTITY = "dev-local";
 const MAX_REQUEST_BYTES = 512 * 1024;
@@ -32,7 +34,7 @@ const MIME_TYPES = new Map([
 ]);
 
 export class LocalDaemon {
-  constructor({ contentRoot, port = 0, stateDirectory = null, evidenceDirectory = null, browserName = "chrome", browserPath = null, buildIdentity = DEFAULT_BUILD_IDENTITY }) {
+  constructor({ contentRoot, port = 0, stateDirectory = null, evidenceDirectory = null, browserName = "chrome", browserPath = null, buildIdentity = DEFAULT_BUILD_IDENTITY, watcherRegistry = defaultWatcherRegistry, stabilityWindowMs = 200, maxStabilityWaitMs = 10000, clock = null, eventHistoryLimit = 256 }) {
     this.inputContentRoot = contentRoot;
     this.port = port;
     this.stateDirectory = stateDirectory || path.join(process.env.LOCALAPPDATA || os.tmpdir(), "SHppt");
@@ -41,6 +43,11 @@ export class LocalDaemon {
     this.browserName = browserName;
     this.browserPath = browserPath;
     this.buildIdentity = buildIdentity;
+    this.watcherRegistry = watcherRegistry;
+    this.stabilityWindowMs = stabilityWindowMs;
+    this.maxStabilityWaitMs = maxStabilityWaitMs;
+    this.clock = clock;
+    this.eventHistoryLimit = eventHistoryLimit;
     this.contentRoot = null;
     this.projectId = null;
     this.snapshot = null;
@@ -56,13 +63,15 @@ export class LocalDaemon {
     this.annotationPersistChain = Promise.resolve();
     this.overlayCaptures = new Map();
     this.sseClients = new Set();
-    this.streamEpoch = randomUUID();
-    this.sequence = 0;
+    this.eventLog = null;
+    this.projectObserver = null;
+    this.watcherLease = null;
   }
 
   async start() {
     this.contentRoot = await canonicalizeContentRoot(this.inputContentRoot);
     this.projectId = await loadOrCreateProjectId(this.stateDirectory, this.contentRoot);
+    this.eventLog = new ProjectEventLog({ projectId: this.projectId, historyLimit: this.eventHistoryLimit });
     await fs.mkdir(this.evidenceDirectory, { recursive: true });
     await this.loadAnnotations();
     await this.rescan();
@@ -75,10 +84,31 @@ export class LocalDaemon {
     });
     this.port = this.server.address().port;
     this.origin = `http://127.0.0.1:${this.port}`;
+    this.projectObserver = new StableProjectObserver({
+      scan: () => scanProject({ contentRoot: this.contentRoot, projectId: this.projectId }),
+      initialSnapshot: this.snapshot,
+      stabilityWindowMs: this.stabilityWindowMs,
+      maxStabilityWaitMs: this.maxStabilityWaitMs,
+      ...(this.clock ? { clock: this.clock } : {}),
+      onPending: (change) => this.onFileChangePending(change),
+      onStable: (change) => this.onFileChangeStable(change),
+      onFailure: (change) => this.onFileChangeFailure(change),
+      onTimeout: (change) => this.onFileStabilityTimeout(change)
+    });
+    try {
+      this.watcherLease = this.watcherRegistry.acquire(this.contentRoot, (event) => this.projectObserver.notify(event));
+    } catch (error) {
+      await new Promise((resolve) => this.server.close(resolve));
+      this.server = null;
+      throw new RuntimeError("WATCHER_UNAVAILABLE", "The Project watcher could not be started.", { cause: error.code || "unknown" });
+    }
     return { origin: this.origin, projectId: this.projectId, snapshot: this.snapshot ? publicSnapshot(this.snapshot) : null, scanFailure: this.scanFailure };
   }
 
   async stop() {
+    this.watcherLease?.release();
+    this.watcherLease = null;
+    this.projectObserver?.cancel();
     for (const client of this.sseClients) {
       clearInterval(client.heartbeat);
       client.response.end();
@@ -90,17 +120,71 @@ export class LocalDaemon {
   async rescan() {
     const previousVersion = this.snapshot?.fileIndexVersion || null;
     try {
-      this.snapshot = await scanProject({ contentRoot: this.contentRoot || this.inputContentRoot, projectId: this.projectId || randomUUID() });
+      const nextSnapshot = await scanProject({ contentRoot: this.contentRoot || this.inputContentRoot, projectId: this.projectId || randomUUID() });
+      this.snapshot = nextSnapshot;
+      if (this.projectObserver) this.projectObserver.snapshot = nextSnapshot;
       this.scanFailure = null;
-      if (previousVersion !== this.snapshot.fileIndexVersion) this.previewScopes.clear();
-      if (this.origin) this.publish("project.scan-ready", { fileIndexVersion: this.snapshot.fileIndexVersion });
+      if (this.origin) this.publish("project.scan-ready", { fileIndexVersion: this.snapshot.fileIndexVersion }, { fileIndexVersion: this.snapshot.fileIndexVersion });
       return this.snapshot;
     } catch (error) {
-      this.snapshot = null;
-      this.previewScopes.clear();
       this.scanFailure = publicError(error);
-      if (this.origin) this.publish("project.scan-failed", { error: this.scanFailure });
+      if (this.origin) this.publish("project.scan-failed", { error: this.scanFailure }, { fileIndexVersion: previousVersion });
       return null;
+    }
+  }
+
+  onFileChangePending(change) {
+    this.publish("project.file-change-pending", change, { origin: change.origin });
+    this.markPreviewsStale("file-change-pending");
+  }
+
+  onFileChangeStable(change) {
+    const fromFileIndexVersion = change.previousSnapshot?.fileIndexVersion ?? this.snapshot?.fileIndexVersion ?? null;
+    const toFileIndexVersion = change.snapshot.fileIndexVersion;
+    this.snapshot = change.snapshot;
+    this.scanFailure = null;
+    if (fromFileIndexVersion === toFileIndexVersion) {
+      this.restoreUnchangedPreviews();
+      return;
+    }
+    this.publish("project.file-changed", {
+      fromFileIndexVersion,
+      toFileIndexVersion,
+      paths: change.paths,
+      configuration: change.configuration
+    }, { fileIndexVersion: toFileIndexVersion, origin: change.origin });
+  }
+
+  onFileChangeFailure(change) {
+    this.markPreviewsStale(change.error.code === "WATCHER_UNAVAILABLE" ? "watcher-unavailable" : "project-scan-failed");
+    this.scanFailure = change.error.code === "WATCHER_UNAVAILABLE"
+      ? change.error
+      : { code: "PROJECT_SCAN_FAILED", message: "The changed Project could not produce a complete File Index snapshot.", details: { cause: change.error.code } };
+    this.publish("project.scan-failed", { ...change, error: this.scanFailure }, { fileIndexVersion: this.snapshot?.fileIndexVersion ?? null, origin: change.origin });
+  }
+
+  onFileStabilityTimeout(change) {
+    this.scanFailure = change.error;
+    this.publish("project.file-stability-timeout", change, { fileIndexVersion: this.snapshot?.fileIndexVersion ?? null, origin: change.origin });
+  }
+
+  markPreviewsStale(reason) {
+    for (const preview of this.previews.values()) {
+      if (preview.status === "expired" || preview.status === "error") continue;
+      preview.status = "stale";
+      preview.state = "stale";
+      preview.reason = reason;
+      this.publish("preview.stale", previewEventPayload(preview), { scope: "preview-session", previewSessionId: preview.previewSessionId, fileIndexVersion: preview.fileIndexVersion });
+    }
+  }
+
+  restoreUnchangedPreviews() {
+    for (const preview of this.previews.values()) {
+      if (preview.status !== "stale" || preview.reason !== "file-change-pending" || preview.lastReadyFileIndexVersion !== this.snapshot.fileIndexVersion) continue;
+      preview.status = "ready";
+      preview.state = "ready";
+      preview.reason = null;
+      this.publish("preview.ready", previewEventPayload(preview), { scope: "preview-session", previewSessionId: preview.previewSessionId, fileIndexVersion: preview.fileIndexVersion });
     }
   }
 
@@ -138,11 +222,12 @@ export class LocalDaemon {
   }
 
   project(response) {
-    if (this.scanFailure || !this.snapshot) return sendJson(response, 409, { error: this.scanFailure || { code: "PROJECT_SCAN_FAILED", message: "Project scan has not succeeded.", details: {} } });
+    if (!this.snapshot) return sendJson(response, 409, { error: this.scanFailure || { code: "PROJECT_SCAN_FAILED", message: "Project scan has not succeeded.", details: {} } });
     return sendJson(response, 200, {
       project: publicSnapshot(this.snapshot),
-      preview: { state: "idle", ready: false, renderer: "cdp" },
-      annotations: this.publicAnnotations()
+      preview: { state: this.scanFailure ? "stale" : "idle", ready: false, renderer: "cdp" },
+      annotations: this.publicAnnotations(),
+      scanError: this.scanFailure
     });
   }
 
@@ -330,8 +415,10 @@ export class LocalDaemon {
 
   async createPreview(request, response) {
     if (this.scanFailure || !this.snapshot) throw new RuntimeError("PROJECT_SCAN_FAILED", "A valid Project snapshot is required before preview.");
+    const targetSnapshot = this.snapshot;
     const body = await readJsonBody(request);
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new RuntimeError("HTTP_JSON_INVALID", "Preview request must be a JSON object.");
+    if (this.snapshot !== targetSnapshot || this.scanFailure) throw new RuntimeError("PROJECT_VERSION_MISMATCH", "The Project changed while the preview request was being read.");
     if (body.projectId !== this.snapshot.projectId) throw new RuntimeError("PROJECT_ID_MISMATCH", "Project identity did not match the active snapshot.");
     if (body.fileIndexVersion !== this.snapshot.fileIndexVersion) throw new RuntimeError("PROJECT_VERSION_MISMATCH", "Preview requested an outdated File Index snapshot.");
     const slideId = body.slideId;
@@ -366,11 +453,15 @@ export class LocalDaemon {
       iframeInstanceId,
       projectId: this.projectId,
       fileIndexVersion: this.snapshot.fileIndexVersion,
+      entryPath: targetSnapshot.entryPath,
+      fixtureHash: targetSnapshot.fixtureHash,
       slideId,
       rendererUrl,
       status: "loading",
       state: "loading",
       error: null,
+      reason: null,
+      lastReadyFileIndexVersion: null,
       createdAt: new Date().toISOString(),
       renderingIdentity: null,
       screenshot: null,
@@ -378,12 +469,12 @@ export class LocalDaemon {
       evidenceManifestId: null
     };
     this.previews.set(previewSessionId, preview);
-    this.publish("preview.loading", { previewSessionId, iframeInstanceId, slideId, state: "loading", fileIndexVersion: this.snapshot.fileIndexVersion, rendererUrl });
+    this.publish("preview.loading", { previewSessionId, iframeInstanceId, slideId, state: "loading", fileIndexVersion: this.snapshot.fileIndexVersion, rendererUrl }, { scope: "preview-session", previewSessionId, fileIndexVersion: this.snapshot.fileIndexVersion });
     const screenshotDirectory = path.join(this.evidenceDirectory, this.projectId, previewSessionId);
     try {
       const renderer = new CdpRenderer({ browserName: this.browserName, browserPath: this.browserPath, viewport, dpr, hostOrigin: this.origin });
       const result = await renderer.render({ rendererUrl: captureRendererUrl, slideIds: [slideId], screenshotDirectory });
-      const observation = validateObservation(result.observation, this.snapshot, scope);
+      const observation = validateObservation(result.observation, targetSnapshot, scope);
       scope.lastBridgeSequence = observation.sequence;
       const screenshotFile = result.screenshots[slideId];
       if (!screenshotFile) throw new RuntimeError("PREVIEW_SCREENSHOT_FAILED", "The renderer did not return a Slide screenshot.");
@@ -393,7 +484,8 @@ export class LocalDaemon {
       const assetId = randomUUID();
       const assetPath = path.join(screenshotDirectory, `${slideId}-${assetId}.png`);
       await fs.writeFile(assetPath, screenshotBytes);
-      const fontHash = this.snapshot.files.find((file) => file.kind === "font")?.contentHash || null;
+      if (preview.status !== "loading" || this.snapshot?.fileIndexVersion !== preview.fileIndexVersion || this.scanFailure) throw new RuntimeError("PREVIEW_FRAME_STALE", "The Project changed before the preview became ready.");
+      const fontHash = targetSnapshot.files.find((file) => file.kind === "font")?.contentHash || null;
       const renderingIdentity = {
         os: `${os.platform()} ${os.release()} ${os.arch()}`,
         node: process.version,
@@ -403,7 +495,7 @@ export class LocalDaemon {
         viewport,
         dpr,
         fontHash,
-        fixtureHash: this.snapshot.fixtureHash,
+        fixtureHash: targetSnapshot.fixtureHash,
         buildIdentity: this.buildIdentity,
         projectId: this.projectId,
         fileIndexVersion: this.snapshot.fileIndexVersion,
@@ -427,15 +519,15 @@ export class LocalDaemon {
         renderingIdentity,
         assertions: ["bridge-handshake", "dom-observation", "non-empty-slide", "png-screenshot", "font-and-resource-observation"]
       });
-      Object.assign(preview, { status: "ready", state: "ready", observation, screenshot, renderingIdentity, evidenceManifestId: evidenceManifest.manifestId });
-      this.publish("preview.ready", { previewSessionId, iframeInstanceId, slideId, state: "ready", fileIndexVersion: this.snapshot.fileIndexVersion, rendererUrl, evidenceManifestId: evidenceManifest.manifestId });
+      Object.assign(preview, { status: "ready", state: "ready", reason: null, lastReadyFileIndexVersion: preview.fileIndexVersion, observation, screenshot, renderingIdentity, evidenceManifestId: evidenceManifest.manifestId });
+      this.publish("preview.ready", { previewSessionId, iframeInstanceId, slideId, state: "ready", fileIndexVersion: preview.fileIndexVersion, rendererUrl, evidenceManifestId: evidenceManifest.manifestId }, { scope: "preview-session", previewSessionId, fileIndexVersion: preview.fileIndexVersion });
       return sendJson(response, 200, { preview: publicPreview(preview), observation, screenshot, renderingIdentity, evidenceManifest });
     } catch (error) {
       const runtimeError = error instanceof RuntimeError ? error : new RuntimeError("PREVIEW_RENDER_FAILED", "The renderer failed before producing a trustworthy preview.");
       const failure = publicError(runtimeError);
       const evidenceManifest = await this.writeEvidence({ result: "failed", preview, error: failure, assertions: ["preview-ready-gate"] });
       Object.assign(preview, { status: "error", state: "error", error: failure, evidenceManifestId: evidenceManifest.manifestId });
-      this.publish("preview.error", { previewSessionId, iframeInstanceId, slideId, state: "error", rendererUrl, error: failure, evidenceManifestId: evidenceManifest.manifestId });
+      this.publish("preview.error", { previewSessionId, iframeInstanceId, slideId, state: "error", rendererUrl, error: failure, evidenceManifestId: evidenceManifest.manifestId }, { scope: "preview-session", previewSessionId, fileIndexVersion: preview.fileIndexVersion });
       return sendJson(response, 422, { preview: publicPreview(preview), error: failure, evidenceManifest });
     }
   }
@@ -457,32 +549,24 @@ export class LocalDaemon {
     response.write(`retry: 1000\n\n`);
     const client = { response, heartbeat: setInterval(() => response.write(": heartbeat\n\n"), 15000) };
     this.sseClients.add(client);
-    response.write(`event: subscription.snapshot\ndata: ${JSON.stringify({ schemaVersion: 1, streamEpoch: this.streamEpoch, sequence: this.sequence, project: this.snapshot ? publicSnapshot(this.snapshot) : null, annotations: this.publicAnnotations(), error: this.scanFailure })}\n\n`);
+    const recovery = this.eventLog.recovery(request.headers["last-event-id"], this.snapshot ? publicSnapshot(this.snapshot) : null, this.scanFailure, { annotations: this.publicAnnotations() });
+    for (const event of recovery.events) writeSse(response, event);
     request.on("close", () => {
       clearInterval(client.heartbeat);
       this.sseClients.delete(client);
     });
   }
 
-  publish(eventType, payload) {
-    const event = {
-      schemaVersion: 1,
-      eventId: `${this.streamEpoch}:${this.sequence + 1}`,
-      streamEpoch: this.streamEpoch,
-      sequence: ++this.sequence,
-      eventType,
-      scope: "project",
-      projectId: this.projectId,
-      occurredAt: new Date().toISOString(),
-      fileIndexVersion: this.snapshot?.fileIndexVersion || null,
-      artifactVersionId: null,
-      origin: "system",
-      runId: null,
-      previewSessionId: payload.previewSessionId || null,
+  publish(eventType, payload, options = {}) {
+    const event = this.eventLog.publish(eventType, {
+      fileIndexVersion: options.fileIndexVersion ?? this.snapshot?.fileIndexVersion ?? null,
+      origin: options.origin || "system",
+      scope: options.scope || "project",
+      previewSessionId: options.previewSessionId ?? payload.previewSessionId ?? null,
       payload
-    };
+    });
     for (const client of this.sseClients) {
-      try { client.response.write(`id: ${event.eventId}\nevent: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`); } catch {}
+      try { writeSse(client.response, event); } catch {}
     }
     return event;
   }
@@ -520,8 +604,7 @@ export class LocalDaemon {
     if (slash <= 0) throw new RuntimeError("PREVIEW_SCOPE_INVALID", "Preview scope is missing.");
     const scopeId = remainder.slice(0, slash);
     const projectPath = decodePath(remainder.slice(slash + 1));
-    const scope = this.previewScopes.get(scopeId);
-    if (!scope || scope.expiresAt < Date.now()) throw new RuntimeError("PREVIEW_SCOPE_EXPIRED", "Preview scope is expired or unknown.");
+    const scope = this.activeScope(scopeId);
     if (scope.projectId !== this.projectId || scope.fileIndexVersion !== this.snapshot?.fileIndexVersion) throw new RuntimeError("PREVIEW_VERSION_MISMATCH", "Preview scope does not match the active File Index snapshot.");
     const file = getFile(this.snapshot, projectPath);
     if (!file) throw new RuntimeError("PROJECT_RESOURCE_INVALID", "Preview Resource is not in the active File Index.");
@@ -558,8 +641,34 @@ export class LocalDaemon {
   scopeForPath(pathname) {
     const prefix = "/renderer/";
     const scopeId = pathname.slice(prefix.length).split("/", 1)[0];
+    return this.activeScope(scopeId);
+  }
+
+  activeScope(scopeId) {
     const scope = this.previewScopes.get(scopeId);
-    if (!scope || scope.expiresAt < Date.now()) throw new RuntimeError("PREVIEW_SCOPE_EXPIRED", "Preview scope is expired or unknown.");
+    if (!scope || scope.expiresAt < Date.now()) {
+      if (scope) {
+        const preview = this.previews.get(scope.previewSessionId);
+        if (preview && preview.status !== "expired") {
+          preview.status = "expired";
+          preview.state = "expired";
+          preview.reason = "preview-scope-expired";
+          this.publish("preview.expired", previewEventPayload(preview), { scope: "preview-session", previewSessionId: preview.previewSessionId, fileIndexVersion: preview.fileIndexVersion });
+        }
+        this.previewScopes.delete(scopeId);
+      }
+      throw new RuntimeError("PREVIEW_SCOPE_EXPIRED", "Preview scope is expired or unknown.");
+    }
+    if (scope.projectId !== this.projectId || scope.fileIndexVersion !== this.snapshot?.fileIndexVersion) {
+      const preview = this.previews.get(scope.previewSessionId);
+      if (preview && preview.status !== "stale") {
+        preview.status = "stale";
+        preview.state = "stale";
+        preview.reason = "preview-version-mismatch";
+        this.publish("preview.stale", previewEventPayload(preview), { scope: "preview-session", previewSessionId: preview.previewSessionId, fileIndexVersion: preview.fileIndexVersion });
+      }
+      throw new RuntimeError("PREVIEW_VERSION_MISMATCH", "Preview scope does not match the active File Index snapshot.");
+    }
     return scope;
   }
 
@@ -584,11 +693,11 @@ export class LocalDaemon {
       buildIdentity: this.buildIdentity,
       projectId: preview.projectId,
       fileIndexVersion: preview.fileIndexVersion,
-      entryPath: this.snapshot?.entryPath || null,
+      entryPath: preview.entryPath || null,
       slideId: preview.slideId,
       previewSessionId: preview.previewSessionId,
       iframeInstanceId: preview.iframeInstanceId,
-      fixtureHash: this.snapshot?.fixtureHash || null,
+      fixtureHash: preview.fixtureHash || null,
       renderingIdentity,
       assertions,
       screenshot,
@@ -730,6 +839,22 @@ function encodeProjectPath(value) {
 
 function publicPreview(preview) {
   return JSON.parse(JSON.stringify(preview));
+}
+
+function previewEventPayload(preview) {
+  return {
+    previewSessionId: preview.previewSessionId,
+    iframeInstanceId: preview.iframeInstanceId,
+    slideId: preview.slideId,
+    state: preview.state,
+    reason: preview.reason,
+    fileIndexVersion: preview.fileIndexVersion,
+    lastReadyFileIndexVersion: preview.lastReadyFileIndexVersion
+  };
+}
+
+function writeSse(response, event) {
+  response.write(`id: ${event.eventId}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`);
 }
 
 async function readJsonBody(request) {
